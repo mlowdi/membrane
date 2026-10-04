@@ -23,6 +23,9 @@ import type {
   StreamParser,
 } from './types.js';
 
+import { responsesToolResultOutput } from '../providers/responses-input.js';
+import { filterImageMessages, sameResponsesItem } from '../utils/image-policy.js';
+
 export const OPENAI_RESPONSES_ITEMS_METADATA_KEY = 'openaiResponsesItems';
 
 class ResponsesPassthroughParser implements StreamParser {
@@ -78,8 +81,9 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
   buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
     const items: NativeItem[] = [];
     let hasImportedItems = false;
+    const validated = filterImageMessages(messages, { maxLiveImages: 0, maxLiveImageBytes: 0, imageStripDepthTokens: 0 });
 
-    for (const message of messages) {
+    for (const message of validated) {
       const nativeItems = message.metadata?.[OPENAI_RESPONSES_ITEMS_METADATA_KEY];
       if (Array.isArray(nativeItems)) {
         items.push(...nativeItems as NativeItem[]);
@@ -87,7 +91,7 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         continue;
       }
 
-      const seenRawItems = new Set<string>();
+      const seenRawItems: NativeItem[] = [];
       let pendingParts: ContentBlock[] = [];
       const flushPending = () => {
         if (pendingParts.length === 0) return;
@@ -103,12 +107,12 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         }
 
         flushPending();
-        const key = typeof rawItem.id === 'string'
-          ? `${rawItem.type ?? ''}:${rawItem.id}`
-          : JSON.stringify(rawItem);
-        if (!seenRawItems.has(key)) {
+        const seen = seenRawItems.some(item => typeof rawItem.id === 'string'
+          ? item.type === rawItem.type && item.id === rawItem.id
+          : sameResponsesItem(item, rawItem));
+        if (!seen) {
           items.push(rawItem);
-          seenRawItems.add(key);
+          seenRawItems.push(rawItem);
         }
       }
       flushPending();
@@ -142,6 +146,7 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         name: tool.name,
         description: tool.description,
         parameters: tool.inputSchema,
+        strict: false,
       })),
       ready: true,
     };
@@ -190,9 +195,7 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         out.push({
           type: 'function_call_output',
           call_id: block.toolUseId,
-          output: typeof block.content === 'string'
-            ? block.content
-            : JSON.stringify(block.content),
+          output: responsesToolResultOutput(block.content),
         });
       } else if (block.type === 'redacted_thinking') {
         flushMessage();
@@ -207,7 +210,7 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
     return JSON.stringify(results.map(result => ({
       type: 'function_call_output',
       call_id: result.toolUseId,
-      output: result.content,
+      output: responsesToolResultOutput(result.content),
     })));
   }
 

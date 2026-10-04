@@ -4,6 +4,7 @@
 
 import type { NormalizedMessage } from './message.js';
 import type { ToolDefinition } from './tools.js';
+import type { LiveImagePolicy } from '../utils/image-policy.js';
 
 // ============================================================================
 // Generation Config
@@ -123,6 +124,9 @@ export interface NormalizedRequest {
    * mutation). Intended for summarizer/compression callers.
    */
   shedOversizeImages?: boolean;
+  /** Shared policy for every actual request, including native tool-round
+   * appends. Filtering is copy-on-write; raw archives never change. */
+  liveImagePolicy?: LiveImagePolicy;
   /** Conversation messages */
   messages: NormalizedMessage[];
   

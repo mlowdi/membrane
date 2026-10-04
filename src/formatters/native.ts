@@ -29,8 +29,28 @@ import type {
   StreamEmission,
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
-import { isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
 import { assertCacheMarkersWithinLimit } from '../utils/cache-marker-budget.js';
+import { normalizeImageContent, projectNativeImageContent } from '../utils/image-policy.js';
+
+/** Native tools and maintenance formatters share the same source conversion.
+ * Content arrays are media, not JSON text. Nested result envelopes are projected
+ * in order onto the enclosing provider output's content parts. */
+export function nativeToolResultContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.flatMap((block): unknown[] => {
+    if (!block || typeof block !== 'object') return [block];
+    if (block.type === 'tool_result' && Array.isArray(block.content)) {
+      return nativeToolResultContent(block.content) as unknown[];
+    }
+    if (block.type !== 'image') return [block];
+    const image = normalizeImageContent(block);
+    if (image.type !== 'image') return [image];
+    return [{ type: 'image', source: image.source.type === 'url'
+      ? image.source
+      : { type: 'base64', media_type: image.source.mediaType, data: image.source.data },
+      ...(image.sourceUrl ? { sourceUrl: image.sourceUrl } : {}) }];
+  });
+}
 
 /** Index of the last content block that can carry cache_control. Anthropic
  *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
@@ -246,7 +266,7 @@ export class NativeFormatter implements PrefillFormatter {
       const role: 'user' | 'assistant' = isAssistant ? 'assistant' : 'user';
 
       // Convert content
-      const content = this.convertContent(message.content, message.participant, {
+      const content = this.convertContent(projectNativeImageContent(message), message.participant, {
         includeNames: participantMode === 'multiuser' && !isAssistant,
       });
 
@@ -399,25 +419,6 @@ export class NativeFormatter implements PrefillFormatter {
   // PRIVATE HELPERS
   // ==========================================================================
 
-  /** Replace API-unacceptable image blocks nested in tool_result content with
-   *  text placeholders. Non-array content passes through untouched. */
-  private static sanitizeToolResultContent(content: unknown): unknown {
-    if (!Array.isArray(content)) return content;
-    return content.map((item) => {
-      if (
-        item &&
-        typeof item === 'object' &&
-        (item as { type?: string }).type === 'image'
-      ) {
-        const src = (item as { source?: { media_type?: string } }).source;
-        if (!isAcceptedImageMediaType(src?.media_type)) {
-          return strippedImagePlaceholder(src?.media_type);
-        }
-      }
-      return item;
-    });
-  }
-
   private convertContent(
     content: ContentBlock[],
     participant: string,
@@ -444,26 +445,17 @@ export class NativeFormatter implements PrefillFormatter {
         }
         result.push(textBlock);
       } else if (block.type === 'image') {
-        if (block.source.type === 'base64') {
-          if (!isAcceptedImageMediaType(block.source.mediaType)) {
-            // Unacceptable media type (e.g. image/svg): degrade to a text
-            // placeholder instead of poisoning the whole request.
-            result.push(strippedImagePlaceholder(block.source.mediaType));
-          } else {
-            const imageBlock: Record<string, unknown> = {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: block.source.mediaType,
-                data: block.source.data,
-              },
-            };
-            // Preserve sourceUrl for providers that use URL-as-text (Gemini 3.x)
-            if (block.sourceUrl) {
-              imageBlock.sourceUrl = block.sourceUrl;
-            }
-            result.push(imageBlock);
-          }
+        const image = normalizeImageContent(block as unknown as Record<string, unknown>);
+        if (image.type !== 'image') {
+          result.push(image);
+        } else if (image.source.type === 'base64') {
+          result.push({
+            type: 'image',
+            source: { type: 'base64', media_type: image.source.mediaType, data: image.source.data },
+            ...(image.sourceUrl ? { sourceUrl: image.sourceUrl } : {}),
+          });
+        } else {
+          result.push({ type: 'image', source: image.source });
         }
       } else if (block.type === 'audio') {
         // Pass audio through in the same shape as images — the provider
@@ -490,7 +482,7 @@ export class NativeFormatter implements PrefillFormatter {
         result.push({
           type: 'tool_result',
           tool_use_id: block.toolUseId,
-          content: NativeFormatter.sanitizeToolResultContent(block.content),
+          content: nativeToolResultContent(block.content),
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {

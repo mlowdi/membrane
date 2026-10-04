@@ -3,8 +3,9 @@
  * builders' `extra` contract (A3 MINOR-5).
  *
  * When a tool result carries an image in XML prefill mode, membrane splits
- * the assistant turn — assistant(text) / user([image]) / assistant(closing
- * XML) — because the API only accepts images in user turns. The split has to
+ * the assistant turn — assistant(text) / user([images and intervening
+ * text/XML]) / assistant(closing XML) — because images require user turns.
+ * The split has to
  * be PERSISTED: every later continuation rebuilds its messages from the
  * turn's build result, so a split that lives only in one request vanishes on
  * the next round while the accumulated document still claims a screenshot
@@ -13,7 +14,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
-import type { NormalizedRequest, ToolResult, ToolResultContentBlock } from '../../src/types/index.js';
+import type { NormalizedRequest, ToolCall, ToolResult, ToolResultContentBlock } from '../../src/types/index.js';
+import type { ProviderSplitContentBlock } from '../../src/utils/tool-parser.js';
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -206,6 +208,105 @@ describe('a second image round composes onto the first', () => {
     expect(secondAssistant).not.toContain('zz preamble one');
     expect(secondAssistant).toContain('zz preamble two');
     expect(thirdAssistant).not.toContain('zz preamble two');
+  });
+});
+
+describe('ordered multi-result image continuations', () => {
+  it.each(['callback', 'yielding'] as const)('retains every visual/text seam across image and plain rounds in %s streaming', async mode => {
+    const nestedUrl = 'https://example.test/nested.png';
+    const laterUrl = 'https://example.test/later-result.png';
+    const nextRoundUrl = 'https://example.test/next-round.png';
+    const firstMarkers = [
+      'before-first-image', `<image:${ZZ_PIXEL}>`, 'after-first-image',
+      'nested-prefix', `<image:${nestedUrl}>`, 'nested-suffix',
+      'before-second-result-image', `<image:${laterUrl}>`, 'after-second-result-image',
+    ];
+    const nextMarkers = ['before-next-round-image', `<image:${nextRoundUrl}>`, 'after-next-round-image'];
+    const adapter = new RecordingXmlAdapter([
+      { text: `${CALL_XML}\n<invoke name="zz_link"></invoke>`, stopReason: 'stop_sequence', stopSequence: '</function_calls>' },
+      { text: `zz second round\n${CALL_XML}`, stopReason: 'stop_sequence', stopSequence: '</function_calls>' },
+      { text: `zz third round\n${CALL_XML}`, stopReason: 'stop_sequence', stopSequence: '</function_calls>' },
+      { text: 'zz final answer', stopReason: 'end_turn' },
+    ]);
+    const membrane = new Membrane(adapter);
+    let toolRound = 0;
+    const resultsFor = (calls: ToolCall[]): ToolResult[] => {
+      toolRound++;
+      if (toolRound === 1) {
+        expect(calls.map(call => call.name)).toEqual(['zz_shot', 'zz_link']);
+        return [
+          { toolUseId: calls[0]!.id, content: [
+            { type: 'text', text: 'before-first-image' },
+            { type: 'image', source: { type: 'base64', data: ZZ_PIXEL, mediaType: 'image/png' } },
+            { type: 'text', text: 'after-first-image' },
+            { type: 'tool_result', toolUseId: 'nested', content: [
+              { type: 'text', text: 'nested-prefix' },
+              { type: 'image', source: { type: 'url', url: nestedUrl } },
+              { type: 'text', text: 'nested-suffix' },
+            ] },
+          ] },
+          { toolUseId: calls[1]!.id, isError: true, content: [
+            { type: 'text', text: 'before-second-result-image' },
+            { type: 'image', source: { type: 'url', url: laterUrl } },
+            { type: 'text', text: 'after-second-result-image' },
+          ] },
+        ];
+      }
+      if (toolRound === 2) return [{ toolUseId: calls[0]!.id, content: [
+        { type: 'text', text: 'before-next-round-image' },
+        { type: 'image', source: { type: 'url', url: nextRoundUrl } },
+        { type: 'text', text: 'after-next-round-image' },
+      ] }];
+      return [textResult(calls[0]!.id)];
+    };
+    let rawAssistantText: string | undefined;
+    if (mode === 'callback') {
+      const response = await membrane.stream(REQUEST, { onToolCalls: async calls => resultsFor(calls) });
+      if ('rawAssistantText' in response) rawAssistantText = response.rawAssistantText;
+    } else {
+      const stream = membrane.streamYielding(REQUEST);
+      for await (const event of stream) {
+        if (event.type === 'tool-calls') stream.provideToolResults(resultsFor(event.calls));
+        else if (event.type === 'complete') rawAssistantText = event.response.rawAssistantText;
+        else if (event.type === 'error') throw event.error;
+        else if (event.type === 'aborted') throw new Error(`Unexpected abort: ${event.reason}`);
+      }
+    }
+    expect(adapter.streamCalls).toBe(4);
+    expect(toolRound).toBe(3);
+    for (let round = 1; round < adapter.requests.length; round++) {
+      const messages = adapter.requests[round]!.messages as Array<{
+        role: string; content: string | ProviderSplitContentBlock[];
+      }>;
+      let ordered = '';
+      for (const message of messages) {
+        if (typeof message.content === 'string') {
+          expect(message.content).not.toContain(ZZ_PIXEL);
+          ordered += message.content;
+        } else for (const block of message.content) {
+          if (block.type === 'text') {
+            expect(block.text).not.toContain(ZZ_PIXEL);
+            ordered += block.text;
+          } else {
+            expect(message.role).toBe('user');
+            ordered += `<image:${block.source.type === 'base64' ? block.source.data : block.source.url}>`;
+          }
+        }
+      }
+      const markers = round === 1 ? firstMarkers : [...firstMarkers, ...nextMarkers];
+      let previous = -1;
+      for (const marker of markers) {
+        expect(ordered.split(marker), `round ${round}: missing or duplicated ${marker}`).toHaveLength(2);
+        const position = ordered.indexOf(marker);
+        expect(position, `round ${round}: reordered ${marker}`).toBeGreaterThan(previous);
+        previous = position;
+      }
+    }
+    expect(rawAssistantText).toBeDefined();
+    expect(rawAssistantText).not.toContain(ZZ_PIXEL);
+    for (const marker of [...firstMarkers, ...nextMarkers]) {
+      if (!marker.startsWith('<image:')) expect(rawAssistantText?.split(marker)).toHaveLength(2);
+    }
   });
 });
 

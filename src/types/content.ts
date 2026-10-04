@@ -147,6 +147,8 @@ export interface ToolResultContent {
    * `<tool_name>` element byte-identically to the live injection.
    */
   toolName?: string;
+  /** Compact archival image-ref inventory; never serialized as prompt content. */
+  imageHistory?: string;
   content: string | ContentBlock[];
   isError?: boolean;
   /**

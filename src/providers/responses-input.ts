@@ -1,5 +1,6 @@
 import type { ProviderRequest } from '../types/index.js';
 import type { OpenAIResponsesInputItem } from './openai-responses-api.js';
+import { normalizeImageContent, IMAGE_UNAVAILABLE_TEXT } from '../utils/image-policy.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -55,7 +56,9 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
         parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: asString(rawBlock.text) });
       } else if (rawBlock.type === 'image') {
         const imageUrl = responsesImageUrl(rawBlock);
-        if (imageUrl && role !== 'assistant') parts.push({ type: 'input_image', image_url: imageUrl });
+        if (role !== 'assistant') parts.push(imageUrl
+          ? { type: 'input_image', image_url: imageUrl }
+          : { type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT });
       } else if (rawBlock.type === 'tool_use') {
         flush();
         output.push(normalizeStandaloneItem(rawBlock));
@@ -76,6 +79,30 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
   return output as OpenAIResponsesInputItem[];
 }
 
+/** Responses tool outputs accept typed image parts. Serializing those parts
+ * into a string makes their base64 data ordinary prompt text instead. */
+export function responsesToolResultOutput(content: unknown): string | JsonObject[] {
+  if (!Array.isArray(content)) {
+    return typeof content === 'string' ? content : JSON.stringify(content ?? null);
+  }
+  return content.flatMap((block): JsonObject[] => {
+    if (isObject(block)) {
+      if (block.type === 'text') return [{ type: 'input_text', text: asString(block.text) }];
+      if (block.type === 'tool_result') {
+        const nested = responsesToolResultOutput(block.content);
+        return typeof nested === 'string' ? [{ type: 'input_text', text: nested }] : nested;
+      }
+      if (block.type === 'image' || block.type === 'input_image') {
+        const imageUrl = responsesImageUrl(block);
+        return [imageUrl ? { type: 'input_image', image_url: imageUrl }
+          : { type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT }];
+      }
+      if (block.type === 'input_text' || block.type === 'input_file') return [block];
+    }
+    return [{ type: 'input_text', text: JSON.stringify(block) }];
+  });
+}
+
 function normalizeStandaloneItem(item: JsonObject): unknown {
   if (item.type === 'tool_use') {
     return {
@@ -90,7 +117,7 @@ function normalizeStandaloneItem(item: JsonObject): unknown {
     return {
       type: 'function_call_output',
       call_id: asString(item.toolUseId) || asString(item.tool_use_id),
-      output: typeof content === 'string' ? content : JSON.stringify(content ?? null),
+      output: responsesToolResultOutput(content),
     };
   }
   if (item.type === 'redacted_thinking') {
@@ -113,13 +140,10 @@ function reasoningInputItem(block: JsonObject): unknown {
 }
 
 function responsesImageUrl(block: JsonObject): string | undefined {
-  const source = isObject(block.source) ? block.source : undefined;
-  if (!source) return typeof block.image_url === 'string' ? block.image_url : undefined;
-  if (source.type === 'url') return asString(source.url) || undefined;
-  if (source.type !== 'base64') return undefined;
-  const mediaType = asString(source.mediaType) || asString(source.media_type) || 'image/png';
-  const data = asString(source.data);
-  return data ? `data:${mediaType};base64,${data}` : undefined;
+  const image = normalizeImageContent(block);
+  if (image.type !== 'image') return undefined;
+  return image.source.type === 'url' ? image.source.url
+    : `data:${image.source.mediaType};base64,${image.source.data}`;
 }
 
 function asString(value: unknown): string {

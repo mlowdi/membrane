@@ -11,7 +11,7 @@
  */
 
 import type { ToolCall, ToolResult, ParsedToolCalls, ContentBlock, ToolResultContentBlock } from '../types/index.js';
-import { isAcceptedImageMediaType, strippedImagePlaceholder } from './image-media.js';
+import { normalizeImageContent } from './image-policy.js';
 
 // ============================================================================
 // Helper Functions
@@ -328,19 +328,34 @@ export function endsWithPartialToolBlock(text: string): boolean {
 const STRUCTURAL_TAG_RE =
   /<\/?(?:antml:)?(?:function_calls|function_results|invoke|result|stdout|error|tool_name)\b/;
 
+function* toolResultContentLeaves(content: string | ToolResultContentBlock[]): Generator<ToolResultContentBlock> {
+  if (typeof content === 'string') {
+    yield { type: 'text', text: content };
+    return;
+  }
+  for (const block of content) {
+    if (block.type === 'tool_result') yield* toolResultContentLeaves(block.content);
+    else if (block.type === 'image') yield normalizeImageContent(block as unknown as Record<string, unknown>);
+    else yield block;
+  }
+}
+
 function renderResultContentString(result: ToolResult): string {
   if (typeof result.content === 'string') {
     return result.content;
   }
   const parts: string[] = [];
-  for (const block of result.content) {
+  for (const block of toolResultContentLeaves(result.content)) {
     if (block.type === 'text') {
       parts.push(block.text);
     } else if (block.type === 'image') {
       // For XML mode, we can't embed images directly
       // Add a note about the image for the model
-      const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-      parts.push(`[Image: ${block.source.mediaType}, ~${sizeKb}KB]`);
+      if (block.source.type === 'url') parts.push('[Image: URL source]');
+      else {
+        const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
+        parts.push(`[Image: ${block.source.mediaType}, ~${sizeKb}KB]`);
+      }
     }
   }
   return parts.join('\n');
@@ -974,7 +989,7 @@ export interface ProviderImageBlock {
     type: 'base64';
     media_type: string;
     data: string;
-  };
+  } | { type: 'url'; url: string };
 }
 
 /**
@@ -983,166 +998,73 @@ export interface ProviderImageBlock {
 export function hasImageInToolResults(results: ToolResult[]): boolean {
   for (const result of results) {
     if (Array.isArray(result.content)) {
-      if (result.content.some(block => block.type === 'image')) {
-        return true;
+      for (const block of toolResultContentLeaves(result.content)) {
+        if (block.type === 'image') return true;
       }
     }
   }
   return false;
 }
 
+/** Provider-ready media and intervening XML/text, in original content order. */
+export type ProviderSplitContentBlock = ProviderImageBlock | { type: 'text'; text: string };
+
 /**
- * Result of separating tool result content for split-turn injection.
- *
- * When tool results contain images in prefill mode, we need to:
- * 1. Put text content in the assistant turn (as XML)
- * 2. Extract images into a separate user turn
- * 3. Continue assistant turn with closing XML
+ * Ordered split around the first and last image across all tool results.
+ * Images must be in a user turn; text/XML between them stays in that same
+ * turn rather than being moved before the first image or after the last.
  */
 export interface SplitTurnContent {
-  /** XML up to and including text content, ending mid-result if images present */
+  /** Complete XML prefix up to the first image, or all XML when none exists. */
   beforeImageXml: string;
-
-  /** Images extracted from results (in provider format) */
-  images: ProviderImageBlock[];
-
-  /** Closing XML after images (closing result tags, function_results) */
+  /** First through last image, including every intervening text/XML seam. */
+  userContent: ProviderSplitContentBlock[];
+  /** XML following the last image, including the closing function_results. */
   afterImageXml: string;
-
-  /** Whether any images were found */
   hasImages: boolean;
 }
 
 /**
- * Format tool results for split-turn injection when images are present.
- *
- * This separates the XML into parts that go in the assistant turn (text)
- * and the user turn (images), with continuation XML for the next assistant turn.
- *
- * Structure when images present:
- * ```
- * Assistant: <function_results>
- *              <result tool_use_id="...">
- *                text content here
- *            [END - mid XML]
- *
- * User: [image blocks]
- *
- * Assistant (prefill): </result>
- *            </function_results>
- * ```
+ * Split tool results into assistant(XML prefix), user(ordered mixed media),
+ * and assistant(XML suffix/prefill). Recursively visit every result; no
+ * image becomes a placeholder merely because an earlier result had one.
  */
 export function formatToolResultsForSplitTurn(results: ToolResult[]): SplitTurnContent {
-  const images: ProviderImageBlock[] = [];
-  let beforeImageXml = '<function_results>\n';
-  let afterImageXml = '';
-  let imageInsertionPoint = -1; // Index of result where we found images
+  const userContent: ProviderSplitContentBlock[] = [];
+  let xml = '<function_results>\n';
+  let beforeImageXml = '';
+  let hasImages = false;
 
-  for (let i = 0; i < results.length; i++) {
-    const result = results[i]!;
-
-    // Check if this result has images
-    let resultHasImages = false;
-    let textParts: string[] = [];
-    let resultImages: ProviderImageBlock[] = [];
-
-    if (typeof result.content === 'string') {
-      textParts.push(guardResultContent(result.content));
-    } else if (Array.isArray(result.content)) {
-      for (const block of result.content) {
-        if (block.type === 'text') {
-          textParts.push(guardResultContent(block.text));
-        } else if (block.type === 'image') {
-          if (!isAcceptedImageMediaType(block.source.mediaType)) {
-            textParts.push(strippedImagePlaceholder(block.source.mediaType).text);
-          } else {
-            resultHasImages = true;
-            resultImages.push({
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: block.source.mediaType,
-                data: block.source.data,
-              },
-            });
-          }
-        }
-      }
-    }
-
-    if (resultHasImages && imageInsertionPoint === -1) {
-      // First result with images - split here
-      imageInsertionPoint = i;
-      images.push(...resultImages);
-
-      // Add opening tags and text content (no closing tags yet)
-      beforeImageXml += resultOpenXml(result);
-      if (textParts.length > 0) {
-        beforeImageXml += textParts.join('\n');
-      }
-      // Note: Intentionally NOT adding closing tags - split happens here
-
-      // After image, we need to close this result and add remaining results
-      afterImageXml = resultCloseXml(result);
-
-      // Process remaining results into afterImageXml
-      for (let j = i + 1; j < results.length; j++) {
-        const remainingResult = results[j]!;
-        afterImageXml += formatSingleResultXml(remainingResult);
-      }
-      afterImageXml += '</function_results>';
-
-      // Stop processing - we've handled everything
-      break;
-    } else if (imageInsertionPoint === -1) {
-      // No images yet - add full result to beforeImageXml
-      beforeImageXml += resultOpenXml(result);
-      beforeImageXml += textParts.join('\n');
-      beforeImageXml += resultCloseXml(result);
-    }
-  }
-
-  // If no images were found, complete the XML normally
-  if (imageInsertionPoint === -1) {
-    beforeImageXml += '</function_results>';
-    return {
-      beforeImageXml,
-      images: [],
-      afterImageXml: '',
-      hasImages: false,
-    };
-  }
-
-  return {
-    beforeImageXml,
-    images,
-    afterImageXml,
-    hasImages: true,
-  };
-}
-
-/**
- * Format a single tool result as complete XML
- */
-function formatSingleResultXml(result: ToolResult): string {
-  let xml = resultOpenXml(result);
-
-  if (typeof result.content === 'string') {
-    xml += guardResultContent(result.content);
-  } else if (Array.isArray(result.content)) {
-    for (const block of result.content) {
+  for (const result of results) {
+    xml += resultOpenXml(result);
+    for (const block of toolResultContentLeaves(result.content)) {
       if (block.type === 'text') {
         xml += guardResultContent(block.text);
       } else if (block.type === 'image') {
-        // For remaining results after split, images become text placeholders
-        const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-        xml += `[Image: ${block.source.mediaType}, ~${sizeKb}KB]`;
+        if (!hasImages) beforeImageXml = xml;
+        else if (xml) userContent.push({ type: 'text', text: xml });
+        xml = '';
+        hasImages = true;
+        userContent.push({
+          type: 'image',
+          source: block.source.type === 'url' ? block.source : {
+            type: 'base64',
+            media_type: block.source.mediaType,
+            data: block.source.data,
+          },
+        });
       }
     }
+    xml += resultCloseXml(result);
   }
+  xml += '</function_results>';
 
-  xml += resultCloseXml(result);
-  return xml;
+  return {
+    beforeImageXml: hasImages ? beforeImageXml : xml,
+    userContent,
+    afterImageXml: hasImages ? xml : '',
+    hasImages,
+  };
 }
 
 // ============================================================================

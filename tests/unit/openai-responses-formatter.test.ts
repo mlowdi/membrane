@@ -4,6 +4,8 @@ import {
   OPENAI_RESPONSES_ITEMS_METADATA_KEY,
 } from '../../src/formatters/openai-responses.js';
 
+import { normalizeResponsesInput } from '../../src/providers/responses-input.js';
+
 const options = {
   participantMode: 'multiuser' as const,
   assistantParticipant: 'Codex',
@@ -11,6 +13,55 @@ const options = {
 };
 
 describe('OpenAIResponsesFormatter', () => {
+  it('keeps tool-result images visual and ordered with the surrounding text', () => {
+    const image = {
+      type: 'image' as const,
+      source: { type: 'base64' as const, mediaType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==' },
+    };
+    const result = new OpenAIResponsesFormatter().buildMessages([
+      { participant: 'Codex', content: [{ type: 'tool_use', id: 'vision', name: 'screenshot', input: {} }] },
+      { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'vision', content: [
+        { type: 'text', text: 'before image' }, image,
+        { type: 'text', text: 'after image' },
+        { type: 'image', source: { type: 'url', url: 'https://example.test/screenshot.png' } },
+      ] }] },
+    ], options);
+    expect(result.messages).toEqual([
+      { type: 'function_call', call_id: 'vision', name: 'screenshot', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'vision', output: [
+        { type: 'input_text', text: 'before image' },
+        { type: 'input_image', image_url: `data:image/png;base64,${image.source.data}` },
+        { type: 'input_text', text: 'after image' },
+        { type: 'input_image', image_url: 'https://example.test/screenshot.png' },
+      ] },
+    ]);
+  });
+
+  it('normalizes maintenance-call image results without rewriting native replay items', () => {
+    const replay = {
+      type: 'function_call_output', call_id: 'old-vision', output: [
+        { type: 'input_image', image_url: 'https://example.test/old.png' },
+      ],
+    };
+    const result = normalizeResponsesInput([
+      replay,
+      { role: 'user', content: [
+        { type: 'tool_result', toolUseId: 'new-vision', content: [
+          { type: 'text', text: 'image from a tool' },
+          { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==' } },
+        ] },
+        { type: 'text', text: 'summarize this exchange' },
+      ] },
+    ]);
+    expect(result).toEqual([
+      replay,
+      { type: 'function_call_output', call_id: 'new-vision', output: [
+        { type: 'input_text', text: 'image from a tool' },
+        { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==' },
+      ] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'summarize this exchange' }] },
+    ]);
+  });
   it('replays native items exactly, then converts only the new tail', () => {
     const reasoning = {
       type: 'reasoning', id: 'rs_1', encrypted_content: 'opaque', summary: [],
