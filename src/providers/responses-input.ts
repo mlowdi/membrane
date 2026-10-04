@@ -1,6 +1,6 @@
 import type { ProviderRequest } from '../types/index.js';
-import { resolveImageMediaType } from '../utils/image-media.js';
 import type { OpenAIResponsesInputItem } from './openai-responses-api.js';
+import { normalizeImageContent, IMAGE_UNAVAILABLE_TEXT } from '../utils/image-policy.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -56,7 +56,9 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
         parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: asString(rawBlock.text) });
       } else if (rawBlock.type === 'image') {
         const imageUrl = responsesImageUrl(rawBlock);
-        if (imageUrl && role !== 'assistant') parts.push({ type: 'input_image', image_url: imageUrl });
+        if (role !== 'assistant') parts.push(imageUrl
+          ? { type: 'input_image', image_url: imageUrl }
+          : { type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT });
       } else if (rawBlock.type === 'tool_use') {
         flush();
         output.push(normalizeStandaloneItem(rawBlock));
@@ -77,6 +79,30 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
   return output as OpenAIResponsesInputItem[];
 }
 
+/** Responses tool outputs accept typed image parts. Serializing those parts
+ * into a string makes their base64 data ordinary prompt text instead. */
+export function responsesToolResultOutput(content: unknown): string | JsonObject[] {
+  if (!Array.isArray(content)) {
+    return typeof content === 'string' ? content : JSON.stringify(content ?? null);
+  }
+  return content.flatMap((block): JsonObject[] => {
+    if (isObject(block)) {
+      if (block.type === 'text') return [{ type: 'input_text', text: asString(block.text) }];
+      if (block.type === 'tool_result') {
+        const nested = responsesToolResultOutput(block.content);
+        return typeof nested === 'string' ? [{ type: 'input_text', text: nested }] : nested;
+      }
+      if (block.type === 'image' || block.type === 'input_image') {
+        const imageUrl = responsesImageUrl(block);
+        return [imageUrl ? { type: 'input_image', image_url: imageUrl }
+          : { type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT }];
+      }
+      if (block.type === 'input_text' || block.type === 'input_file') return [block];
+    }
+    return [{ type: 'input_text', text: JSON.stringify(block) }];
+  });
+}
+
 function normalizeStandaloneItem(item: JsonObject): unknown {
   if (item.type === 'tool_use') {
     return {
@@ -91,9 +117,7 @@ function normalizeStandaloneItem(item: JsonObject): unknown {
     return {
       type: 'function_call_output',
       call_id: asString(item.toolUseId) || asString(item.tool_use_id),
-      output: typeof content === 'string'
-        ? content
-        : responsesToolOutputParts(content) ?? JSON.stringify(content ?? null),
+      output: responsesToolResultOutput(content),
     };
   }
   if (item.type === 'redacted_thinking') {
@@ -115,52 +139,11 @@ function reasoningInputItem(block: JsonObject): unknown {
   return { type: 'reasoning', summary: [], encrypted_content: asString(block.data) };
 }
 
-/**
- * `function_call_output.output` as a native content-part array, for tool
- * results that carry images. Responses accepts `output` as a string OR an
- * array of input_text / input_image parts; stringifying an image-bearing
- * result hands the model its base64 as TEXT — no vision, and ~1 token per
- * 2 base64 chars (a 760 KB snapshot ≈ 500k input tokens; probed live on the
- * Codex backend 2026-10-02: array form = 526 tokens and the model describes
- * the image). Returns null for image-free content so callers keep their
- * legacy string form and existing replay bytes don't change.
- */
-export function responsesToolOutputParts(content: unknown): unknown[] | null {
-  if (!Array.isArray(content)) return null;
-  if (!content.some((block) => isObject(block) && (block.type === 'image' || block.type === 'input_image'))) {
-    return null;
-  }
-  const parts: unknown[] = [];
-  for (const block of content) {
-    if (typeof block === 'string') {
-      parts.push({ type: 'input_text', text: block });
-    } else if (!isObject(block)) {
-      continue;
-    } else if (block.type === 'text') {
-      parts.push({ type: 'input_text', text: asString(block.text) });
-    } else if (block.type === 'image') {
-      const imageUrl = responsesImageUrl(block);
-      parts.push(imageUrl
-        ? { type: 'input_image', image_url: imageUrl }
-        : { type: 'input_text', text: '[image omitted: unsupported image source]' });
-    } else if (block.type === 'input_text' || block.type === 'input_image') {
-      parts.push(block);
-    } else {
-      parts.push({ type: 'input_text', text: JSON.stringify(block) });
-    }
-  }
-  return parts;
-}
-
 function responsesImageUrl(block: JsonObject): string | undefined {
-  const source = isObject(block.source) ? block.source : undefined;
-  if (!source) return typeof block.image_url === 'string' ? block.image_url : undefined;
-  if (source.type === 'url') return asString(source.url) || undefined;
-  if (source.type !== 'base64') return undefined;
-  const data = asString(source.data);
-  const declared = asString(source.mediaType) || asString(source.media_type) || 'image/png';
-  const mediaType = resolveImageMediaType(data, declared);
-  return data ? `data:${mediaType};base64,${data}` : undefined;
+  const image = normalizeImageContent(block);
+  if (image.type !== 'image') return undefined;
+  return image.source.type === 'url' ? image.source.url
+    : `data:${image.source.mediaType};base64,${image.source.data}`;
 }
 
 function asString(value: unknown): string {

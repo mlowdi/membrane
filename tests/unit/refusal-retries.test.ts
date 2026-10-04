@@ -75,6 +75,13 @@ function createRequest(): NormalizedRequest {
 }
 
 describe('refusalRetries — complete()', () => {
+  it('retry:false permits one provider attempt even with a refusal retry budget', async () => {
+    const adapter = new RefusingAdapter(4);
+    const response = await new Membrane(adapter).complete(createRequest(), { retry: false, refusalRetries: 3 });
+    expect(response.stopReason).toBe('refusal');
+    expect(adapter.calls).toBe(1);
+  });
+
   it('is OFF by default: a refusal is returned as-is, one call', async () => {
     const adapter = new RefusingAdapter(1);
     const response = await new Membrane(adapter).complete(createRequest());

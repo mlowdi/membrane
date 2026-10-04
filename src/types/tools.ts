@@ -1,6 +1,7 @@
 /**
  * Tool definition and execution types
  */
+import type { ContentBlock } from './content.js';
 
 // ============================================================================
 // Tool Definition
@@ -75,9 +76,7 @@ export interface ToolResult {
 /**
  * Content block types allowed in tool results
  */
-export type ToolResultContentBlock =
-  | { type: 'text'; text: string }
-  | { type: 'image'; source: { type: 'base64'; data: string; mediaType: string } };
+export type ToolResultContentBlock = ContentBlock;
 
 // ============================================================================
 // Tool Context (passed to execution callback)

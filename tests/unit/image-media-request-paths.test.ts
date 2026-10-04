@@ -6,6 +6,7 @@ import { OpenAIResponsesFormatter } from '../../src/formatters/openai-responses.
 import { AnthropicAdapter, detectImageMediaType } from '../../src/providers/anthropic.js';
 import { OpenAIResponsesAdapter } from '../../src/providers/openai-responses.js';
 import { formatToolResultsForSplitTurn } from '../../src/utils/tool-parser.js';
+import { IMAGE_UNAVAILABLE_TEXT } from '../../src/utils/image-policy.js';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, ProviderAdapter } from '../../src/types/index.js';
 
 // Real 1x1 PNG; other signature tests only exercise header recognition.
@@ -64,7 +65,7 @@ describe.each([
   ['native', () => new NativeFormatter()],
   ['XML', () => new AnthropicXmlFormatter()],
 ] as const)('%s formatter image sanitation', (_name, create) => {
-  it.each(['image/webp', 'image/svg+xml', 'IMAGE/PNG', undefined])(
+  it.each(['image/webp', 'IMAGE/PNG'])(
     'resolves PNG bytes before checking the declared type %s', (label) => {
       const block = { type: 'image', source: { type: 'base64', mediaType: label, data: PNG } };
       const messages = [{ participant: 'User', content: [block] }] as NormalizedMessage[];
@@ -83,8 +84,54 @@ describe.each([
       { participant: 'User', content: [image('image/svg+xml', base64('<svg/>'))] },
     ], options);
     expect(imagesIn(result.messages)).toEqual([]);
-    expect(JSON.stringify(result.messages)).toContain('NOT shown to you');
-    expect(JSON.stringify(result.messages)).toContain('image/svg+xml');
+    expect(JSON.stringify(result.messages)).toContain(_name === 'native' ? IMAGE_UNAVAILABLE_TEXT : 'NOT shown to you');
+    if (_name === 'XML') expect(JSON.stringify(result.messages)).toContain('image/svg+xml');
+    expect(JSON.stringify(result.messages)).not.toContain(base64('<svg/>'));
+  });
+});
+
+describe.each([
+  ['native', () => new NativeFormatter()],
+  ['Responses', () => new OpenAIResponsesFormatter()],
+] as const)('%s strict image admission', (_name, create) => {
+  it.each([undefined, 'image/svg+xml', null, 42])('rejects declared MIME %s even for PNG bytes', (label) => {
+    const messages = [{ participant: 'User', content: [
+      { type: 'text', text: 'before' },
+      { type: 'image', source: { type: 'base64', mediaType: label, data: PNG } },
+      { type: 'text', text: 'after' },
+    ] }] as NormalizedMessage[];
+    const original = structuredClone(messages);
+    const result = create().buildMessages(messages, options);
+    const wire = JSON.stringify(result.messages);
+    expect(imagesIn(result.messages)).toEqual([]);
+    expect(wire).not.toContain('input_image');
+    expect(wire).not.toContain(PNG);
+    expect(wire).toContain(IMAGE_UNAVAILABLE_TEXT);
+    expect(wire).toContain('before');
+    expect(wire).toContain('after');
+    expect(messages).toEqual(original);
+  });
+
+  it('corrects an admitted WebP declaration to PNG without mutating input', () => {
+    const messages = [{ participant: 'User', content: [image('image/webp')] }];
+    const original = structuredClone(messages);
+    const wire = JSON.stringify(create().buildMessages(messages, options).messages);
+    expect(wire).toContain('image/png');
+    expect(wire).not.toContain('image/webp');
+    expect(wire).toContain(PNG);
+    expect(messages).toEqual(original);
+  });
+});
+
+describe('XML formatter signature detection', () => {
+  it.each(['image/svg+xml', undefined])('retains upstream provider-oriented detection for label %s', (label) => {
+    const block = { type: 'image', source: { type: 'base64', mediaType: label, data: PNG } };
+    const result = new AnthropicXmlFormatter().buildMessages([
+      { participant: 'User', content: [block] },
+    ] as NormalizedMessage[], options);
+    expect(imagesIn(result.messages)).toEqual([{
+      type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG },
+    }]);
   });
 });
 
@@ -111,7 +158,8 @@ describe('native tool-result history', () => {
     const result = new NativeFormatter().buildMessages(history(image('image/svg+xml', base64('<svg/>'))), options);
     expect(imagesIn(result.messages)).toEqual([]);
     expect(JSON.stringify(result.messages)).toContain('Screenshot');
-    expect(JSON.stringify(result.messages)).toContain('NOT shown to you');
+    expect(JSON.stringify(result.messages)).toContain(IMAGE_UNAVAILABLE_TEXT);
+    expect(JSON.stringify(result.messages)).not.toContain(base64('<svg/>'));
   });
 });
 
@@ -196,12 +244,24 @@ describe('native streaming and XML split-turn request builders', () => {
     expect(imagesIn(sent[0])[0].source).toEqual({ type: 'base64', media_type: 'image/png', data: PNG });
   });
 
-  it('sniffs images injected by XML tool continuations before the allowlist', () => {
+  it('corrects admitted image signatures in ordered XML tool continuations', () => {
     const result = formatToolResultsForSplitTurn([{
-      toolUseId: 'shot_1', content: [image('image/svg+xml') as any],
+      toolUseId: 'shot_1', content: [image('image/webp')],
     }]);
     expect(result.hasImages).toBe(true);
-    expect(result.images[0]?.source).toEqual({ type: 'base64', media_type: 'image/png', data: PNG });
+    expect(result.userContent).toEqual([{
+      type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG },
+    }]);
+  });
+
+  it('rejects unsupported declarations in recursive XML tool continuations', () => {
+    const result = formatToolResultsForSplitTurn([{
+      toolUseId: 'shot_1', content: [{ type: 'tool_result', toolUseId: 'nested', content: [image('image/svg+xml')] }],
+    }]);
+    expect(result.hasImages).toBe(false);
+    expect(result.userContent).toEqual([]);
+    expect(result.beforeImageXml).toContain(IMAGE_UNAVAILABLE_TEXT);
+    expect(result.beforeImageXml).not.toContain(PNG);
   });
 });
 

@@ -66,10 +66,59 @@ describe('formatToolResults image placeholder mode', () => {
 });
 
 describe('formatToolResultsForSplitTurn', () => {
+  it('preserves both URL images and intervening text across result boundaries', () => {
+    const first = { type: 'image' as const, source: { type: 'url' as const, url: 'https://example.test/first.png' } };
+    const second = { type: 'image' as const, source: { type: 'url' as const, url: 'https://example.test/second.png' } };
+    const split = formatToolResultsForSplitTurn([
+      { toolUseId: 'first', content: [{ type: 'text', text: 'before first' }, first, { type: 'text', text: 'after first' }] },
+      { toolUseId: 'second', content: [{ type: 'text', text: 'before second' }, second, { type: 'text', text: 'after second' }] },
+    ]);
+    expect(split.userContent.filter(block => block.type === 'image')).toEqual([first, second]);
+    const between = split.userContent.filter(block => block.type === 'text').map(block => block.text).join('');
+    expect(between.indexOf('after first')).toBeGreaterThanOrEqual(0);
+    expect(between.indexOf('before second')).toBeGreaterThan(between.indexOf('after first'));
+    expect(split.beforeImageXml).toContain('before first');
+    expect(split.afterImageXml).toContain('after second');
+  });
+
+  it('detects and preserves recursively nested URL and base64 image leaves without encoded XML text', () => {
+    const linked = { type: 'image' as const, source: { type: 'url' as const, url: 'https://example.test/nested.png' } };
+    const result: ToolResult = { toolUseId: 'outer', content: [{ type: 'tool_result', toolUseId: 'nested', content: [
+      { type: 'text', text: 'nested-before' }, linked, { type: 'tool_result', toolUseId: 'deep', content: [
+        { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: sampleImageData } },
+        { type: 'text', text: 'nested-after' },
+      ] },
+    ] }] };
+    expect(hasImageInToolResults([result])).toBe(true);
+    const split = formatToolResultsForSplitTurn([result]);
+    expect(split.hasImages).toBe(true);
+    expect(split.userContent.filter(block => block.type === 'image')).toEqual([linked, { type: 'image', source: {
+      type: 'base64', media_type: 'image/png', data: sampleImageData,
+    } }]);
+    const xml = split.beforeImageXml + split.userContent.filter(block => block.type === 'text').map(block => block.text).join('') + split.afterImageXml;
+    expect(xml).toContain('nested-before');
+    expect(xml).toContain('nested-after');
+    expect(xml).not.toContain(sampleImageData);
+    expect(formatToolResults([result])).not.toContain(sampleImageData);
+  });
+
+  it('malformed nested base64 becomes a bounded unavailable slot instead of a visual or byte-bearing XML part', () => {
+    const result: ToolResult = { toolUseId: 'outer', content: [{ type: 'tool_result', toolUseId: 'nested', content: [
+      { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: '%%%%' } },
+    ] }] };
+    expect(hasImageInToolResults([result])).toBe(false);
+    const split = formatToolResultsForSplitTurn([result]);
+    expect(split.hasImages).toBe(false);
+    expect(split.userContent).toEqual([]);
+    const xml = formatToolResults([result]);
+    expect(xml).not.toContain('%%%%');
+    expect(xml.length).toBeLessThan(500);
+  });
+
   it('degrades to complete XML with no images', () => {
     const split = formatToolResultsForSplitTurn([createTextResult('tool_1', 'Hello world')]);
     expect(split.hasImages).toBe(false);
-    expect(split.images).toEqual([]);
+    expect(split.userContent).toEqual([]);
     expect(split.afterImageXml).toBe('');
     expect(split.beforeImageXml).toContain('<function_results>');
     expect(split.beforeImageXml).toContain('</function_results>');
@@ -78,7 +127,7 @@ describe('formatToolResultsForSplitTurn', () => {
   it('splits a single image result around the image', () => {
     const split = formatToolResultsForSplitTurn([createImageResult('tool_1', 'Screenshot taken')]);
     expect(split.hasImages).toBe(true);
-    expect(split.images).toHaveLength(1);
+    expect(split.userContent).toHaveLength(1);
     // Before: opening tags + text, held open at the image point.
     expect(split.beforeImageXml).toContain('<function_results>');
     expect(split.beforeImageXml).toContain('<tool_name>name_tool_1</tool_name>');
@@ -89,11 +138,9 @@ describe('formatToolResultsForSplitTurn', () => {
     expect(split.afterImageXml).toContain('</stdout>');
     expect(split.afterImageXml).toContain('</result>');
     expect(split.afterImageXml).toContain('</function_results>');
-    // Image block in API shape.
-    const img = split.images[0];
-    expect(img?.type).toBe('image');
-    expect(img?.source.type).toBe('base64');
-    expect(img?.source.media_type).toBe('image/png');
+    expect(split.userContent).toEqual([{ type: 'image', source: {
+      type: 'base64', media_type: 'image/png', data: sampleImageData,
+    } }]);
   });
 
   it('splits at the first image when the FIRST of two results carries it', () => {
@@ -102,7 +149,7 @@ describe('formatToolResultsForSplitTurn', () => {
       createTextResult('tool_2', 'Second result text only'),
     ]);
     expect(split.hasImages).toBe(true);
-    expect(split.images).toHaveLength(1);
+    expect(split.userContent).toHaveLength(1);
     expect(split.beforeImageXml).toContain('<tool_name>name_tool_1</tool_name>');
     expect(split.beforeImageXml).toContain('First result with image');
     // The full second result lands after the image.
@@ -118,7 +165,7 @@ describe('formatToolResultsForSplitTurn', () => {
       createImageResult('tool_2', 'Second result with image'),
     ]);
     expect(split.hasImages).toBe(true);
-    expect(split.images).toHaveLength(1);
+    expect(split.userContent).toHaveLength(1);
     // The complete first result + second result's text ride before the image.
     expect(split.beforeImageXml).toContain('<tool_name>name_tool_1</tool_name>');
     expect(split.beforeImageXml).toContain('First result text only');
@@ -134,11 +181,10 @@ describe('formatToolResultsForSplitTurn', () => {
       createMultiImageResult('tool_1', 'Multiple screenshots', 3),
     ]);
     expect(split.hasImages).toBe(true);
-    expect(split.images).toHaveLength(3);
-    for (const img of split.images) {
-      expect(img.type).toBe('image');
-      expect(img.source.type).toBe('base64');
-    }
+    expect(split.userContent).toHaveLength(3);
+    expect(split.userContent).toEqual(Array.from({ length: 3 }, () => ({
+      type: 'image', source: { type: 'base64', media_type: 'image/png', data: sampleImageData },
+    })));
   });
 
   it('uses the error tag for error results with images', () => {

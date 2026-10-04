@@ -265,6 +265,10 @@ export interface StreamOptions {
 // ============================================================================
 
 export interface CompleteOptions {
+  /** false permits exactly one provider attempt, including 429/529 and refusal retries.
+   * Omitted/true preserves the configured retry policy; streaming is unchanged. */
+  retry?: boolean;
+
   /** Abort signal for cancellation */
   signal?: AbortSignal;
 

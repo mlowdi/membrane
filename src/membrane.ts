@@ -27,7 +27,7 @@ import type {
   RetryConfig,
   ToolDefinition,
 } from './types/index.js';
-import { lastCacheableBlockIndex } from './formatters/native.js';
+import { lastCacheableBlockIndex, nativeToolResultContent } from './formatters/native.js';
 import {
   sameThinkingText,
   findSpanningProviderRun,
@@ -60,7 +60,7 @@ import {
   endsWithPartialToolBlock,
   hasImageInToolResults,
   formatToolResultsForSplitTurn,
-  type ProviderImageBlock,
+  type ProviderSplitContentBlock,
 } from './utils/tool-parser.js';
 import { IncrementalXmlParser, type ProcessChunkResult } from './utils/stream-parser.js';
 import type { ChunkMeta, BlockEvent, MembraneBlockType, MembraneBlock } from './types/streaming.js';
@@ -92,6 +92,7 @@ import {
   shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
+import { filterImageMessages } from './utils/image-policy.js';
 
 // ============================================================================
 // Membrane Class
@@ -308,7 +309,7 @@ export class Membrane {
         // Deliberately BEFORE afterResponse — a hook that logs or transforms
         // should see the attempt that actually stands, not the discarded one.
         if (
-          response.stopReason === 'refusal' &&
+          options.retry !== false && response.stopReason === 'refusal' &&
           refusalRetriesUsed < Math.max(0, options.refusalRetries ?? 0)
         ) {
           refusalRetriesUsed++;
@@ -356,7 +357,7 @@ export class Membrane {
             ? Math.max(this.retryConfig.maxRetries, this.retryConfig.overloaded.maxRetries)
             : this.retryConfig.maxRetries;
 
-        if (errorInfo.retryable && attempts < effectiveMax) {
+        if (options.retry !== false && errorInfo.retryable && attempts < effectiveMax) {
           // Check hook for retry decision
           if (this.config.hooks?.onError) {
             const decision = await this.config.hooks.onError(errorInfo, attempts);
@@ -1054,12 +1055,16 @@ export class Membrane {
                 request,
                 prefillResult,
                 parser.getAccumulated(),
-                splitContent.images,
+                splitContent.userContent,
                 afterImageXml
               );
 
-              // Also add afterImageXml to accumulated for complete rawAssistantText
-              // Note: afterImageXml is internal prefill (closing tags), not emitted via onChunk
+              // Retain all XML/text in rawAssistantText; middle seams live in
+              // the user turn, not in the trailing assistant prefill.
+              // Internal XML is not emitted via onChunk.
+              for (const block of splitContent.userContent) {
+                if (block.type === 'text') parser.push(block.text);
+              }
               parser.push(afterImageXml);
               prefillResult.assistantPrefill = parser.getAccumulated();
 
@@ -1293,6 +1298,10 @@ export class Membrane {
     try {
       // Tool execution loop
       while (toolDepth <= maxToolDepth) {
+        // Own the actual next request, not just the initially compiled prefix.
+        // Keep the filtered working copy so subsequent rounds cannot resurrect
+        // bytes that left the live window; response/audit originals are separate.
+        if (request.liveImagePolicy) messages = filterImageMessages(messages, request.liveImagePolicy);
         // Build provider request with native tools
         const providerRequest = this.buildNativeToolRequest(request, messages, toolDepth > 0, activeFormatter);
 
@@ -1624,7 +1633,7 @@ export class Membrane {
           content.push({
             type: 'tool_result',
             tool_use_id: block.toolUseId,
-            content: block.content,
+            content: nativeToolResultContent(block.content),
             is_error: block.isError,
           });
         } else if (block.type === 'thinking') {
@@ -1663,6 +1672,8 @@ export class Membrane {
               }
               content.push(imageBlock);
             }
+          } else {
+            content.push({ type: 'image', source: block.source });
           }
         }
       }
@@ -2216,8 +2227,10 @@ export class Membrane {
       ?? this.config.maxParticipantsForStop
       ?? 10;
 
+    const messages = request.liveImagePolicy
+      ? filterImageMessages(request.messages, request.liveImagePolicy) : request.messages;
     // Use formatter's buildMessages for all request building
-    const buildResult = activeFormatter.buildMessages(request.messages, {
+    const buildResult = activeFormatter.buildMessages(messages, {
       participantMode: 'multiuser',
       assistantParticipant: request.assistantParticipant ?? this.config.assistantParticipant ?? 'Claude',
       tools: request.tools,
@@ -2456,16 +2469,16 @@ export class Membrane {
    * Build continuation request with split-turn image injection.
    *
    * When tool results contain images in prefill mode, we must:
-   * 1. End assistant turn mid-XML (after text content, inside <function_results>)
-   * 2. Insert user turn with only image content
-   * 3. Continue with assistant prefill containing closing XML tags
+   * 1. End assistant turn mid-XML at the first image
+   * 2. Insert a user turn spanning all images and intervening text/XML
+   * 3. Continue with assistant prefill after the last image, closing XML tags
    *
    * This is required because Anthropic API only allows images in user turns.
    *
    * Structure:
    * ```
    * Assistant: "...response..." + <function_results><result>text content
-   * User: [image blocks]
+   * User: [image, intervening text/XML, image, ...]
    * Assistant (prefill): </result></function_results>
    * ```
    */
@@ -2473,7 +2486,7 @@ export class Membrane {
     originalRequest: NormalizedRequest,
     prefillResult: BuildResult,
     accumulated: string,
-    images: ProviderImageBlock[],
+    userContent: ProviderSplitContentBlock[],
     afterImageXml: string
   ): any {
     // Anthropic quirk: assistant content cannot end with trailing whitespace
@@ -2501,7 +2514,7 @@ export class Membrane {
     const trimmedAfterXml = afterImageXml.trimEnd();
     const splitTurnMessages = [
       { role: 'assistant', content: trailingContent },
-      { role: 'user', content: images },
+      { role: 'user', content: userContent },
       { role: 'assistant', content: trimmedAfterXml },
     ];
 
@@ -2517,11 +2530,15 @@ export class Membrane {
     // leaving <function_results> XML asserting a screenshot the model can no
     // longer see. Reassign (never mutate in place): the previous array is
     // still referenced by the request already on the wire. The watermark
-    // moves to the seam — the point in `accumulated` where afterImageXml is
-    // about to be appended — so the next builder replaces only the closing
-    // assistant turn.
+    // moves past the middle text/XML (which callers append to accumulated
+    // after building this request), so later continuations replace only the
+    // closing assistant turn, not content already in the image user turn.
     prefillResult.messages = messages;
-    prefillResult.accumulatedBaseOffset = accumulated.length;
+    let seamOffset = accumulated.length;
+    for (const block of userContent) {
+      if (block.type === 'text') seamOffset += block.text.length;
+    }
+    prefillResult.accumulatedBaseOffset = seamOffset;
 
     return stripThinkingForPrefill({
       ...this.getBaseProviderParams(originalRequest.config),
@@ -3562,10 +3579,13 @@ export class Membrane {
                 request,
                 prefillResult,
                 parser.getAccumulated(),
-                splitContent.images,
+                splitContent.userContent,
                 afterImageXml
               );
 
+              for (const block of splitContent.userContent) {
+                if (block.type === 'text') parser.push(block.text);
+              }
               parser.push(afterImageXml);
               prefillResult.assistantPrefill = parser.getAccumulated();
               parser.resetForNewIteration();
@@ -3801,6 +3821,10 @@ export class Membrane {
           return;
         }
 
+        // Own the actual next request, not just the initially compiled prefix.
+        // Keep the filtered working copy so subsequent rounds cannot resurrect
+        // bytes that left the live window; response/audit originals are separate.
+        if (request.liveImagePolicy) messages = filterImageMessages(messages, request.liveImagePolicy);
         // Build provider request with native tools
         const providerRequest = this.buildNativeToolRequest(request, messages, toolDepth > 0, activeFormatter);
 

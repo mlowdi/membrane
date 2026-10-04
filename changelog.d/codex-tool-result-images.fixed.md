@@ -1,0 +1,1 @@
+- Keep base64 and URL images in OpenAI Responses tool outputs as typed `input_image` parts instead of serializing their bytes into prompt text. Apply the same conversion to primary formatting and maintenance/compression requests; preserve surrounding text order and provider-native replay items.

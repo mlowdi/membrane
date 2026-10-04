@@ -88,6 +88,32 @@ describe('isOverloadedError', () => {
 });
 
 describe('complete() overloaded retries', () => {
+  for (const [status, failure] of [
+    [429, () => rateLimitError('Too many requests', 0)],
+    [529, overloaded529],
+    [500, () => serverError('Internal server error', 500)],
+  ] as const) {
+    it(`retry:false makes one attempt for ${status}, overriding all transport schedules`, async () => {
+      const adapter = new FlakyAdapter(1, failure);
+      adapter.queueResponse('must not reach the second provider attempt');
+      const membrane = new Membrane(adapter, {
+        retry: { maxRetries: 4, retryDelayMs: 1, maxRetryDelayMs: 2,
+          overloaded: { maxRetries: 4, retryDelayMs: 1, maxRetryDelayMs: 2 } },
+      });
+      await expect(membrane.complete(REQUEST, { retry: false })).rejects.toThrow();
+      expect(adapter.completeCalls).toBe(1);
+    });
+  }
+
+  it('omitting the override preserves the forced 429 retry schedule', async () => {
+    const adapter = new FlakyAdapter(1, () => rateLimitError('Too many requests', 0));
+    adapter.queueResponse('recovered');
+    const membrane = new Membrane(adapter, { retry: { retryDelayMs: 1, maxRetryDelayMs: 2 } });
+    const response = await membrane.complete(REQUEST);
+    expect(adapter.completeCalls).toBe(2);
+    expect(response.content[0]).toMatchObject({ type: 'text', text: 'recovered' });
+  });
+
   it('retries through 529s even with default maxRetries of 0', async () => {
     const adapter = new FlakyAdapter(2, overloaded529);
     adapter.queueResponse('recovered');

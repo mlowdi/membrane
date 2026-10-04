@@ -5,5 +5,8 @@
   previously `JSON.stringify`'d any non-string tool-result content, so the
   model received the image's base64 as text: it could not see the image, and
   a single ~760 KB screenshot cost roughly 500k input tokens (the same image as
-  a native part is ~500). Image-free content arrays keep the existing string
-  form, so replayed histories without tool images are byte-identical.
+  a native part is ~500). Normalized content arrays, including recursively
+  nested tool results, use the shared `responsesToolResultOutput` typed-part
+  projection; string content stays a string. Provider-native replay items
+  remain byte-identical. The superseded flat `responsesToolOutputParts` helper
+  and its callers are removed rather than retained as a compatibility alias.

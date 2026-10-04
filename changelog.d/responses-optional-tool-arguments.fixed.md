@@ -1,0 +1,1 @@
+- Preserve optional arguments in Membrane and Chat Completions function schemas sent through Responses by explicitly opting out of implicit strict-schema normalization. Retain explicit strictness and provider-native function definitions. This avoids forcing empty dates, empty author filters and invalid continuation fields into otherwise valid history-tool calls.

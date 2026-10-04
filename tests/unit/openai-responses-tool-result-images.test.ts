@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { OpenAIResponsesFormatter } from '../../src/formatters/openai-responses.js';
-import { normalizeResponsesInput, responsesToolOutputParts } from '../../src/providers/responses-input.js';
+import { normalizeResponsesInput, responsesToolResultOutput } from '../../src/providers/responses-input.js';
+import { IMAGE_UNAVAILABLE_TEXT } from '../../src/utils/image-policy.js';
 
 const options = {
   participantMode: 'multiuser' as const,
@@ -35,7 +36,7 @@ describe('tool results carrying images (Responses)', () => {
     });
   });
 
-  it('formatter keeps the legacy string form for image-free array content', () => {
+  it('formatter emits typed text parts for normalized image-free array content', () => {
     const formatter = new OpenAIResponsesFormatter();
     const content = [{ type: 'text', text: 'just text' }];
     const result = formatter.buildMessages([
@@ -43,7 +44,7 @@ describe('tool results carrying images (Responses)', () => {
       { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'call_2', content }] },
     ] as any, options);
     const output = (result.messages as any[]).find((m) => m.type === 'function_call_output');
-    expect(output.output).toBe(JSON.stringify(content));
+    expect(output.output).toEqual([{ type: 'input_text', text: 'just text' }]);
   });
 
   it('subscription normalizer converts normalized tool_result images the same way', () => {
@@ -63,17 +64,40 @@ describe('tool results carrying images (Responses)', () => {
     }]);
   });
 
-  it('helper: null for strings and image-free arrays; placeholder for unusable image sources', () => {
-    expect(responsesToolOutputParts('plain')).toBeNull();
-    expect(responsesToolOutputParts([{ type: 'text', text: 'x' }])).toBeNull();
-    expect(responsesToolOutputParts([
+  it('helper preserves strings, projects text arrays and bounds unusable image sources', () => {
+    expect(responsesToolResultOutput('plain')).toBe('plain');
+    expect(responsesToolResultOutput([{ type: 'text', text: 'x' }])).toEqual([{ type: 'input_text', text: 'x' }]);
+    expect(responsesToolResultOutput([
       { type: 'image', source: { type: 'file', path: '/tmp/x.png' } },
       { type: 'image', source: png },
       { type: 'other', value: 1 },
     ])).toEqual([
-      { type: 'input_text', text: '[image omitted: unsupported image source]' },
+      { type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT },
       { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
       { type: 'input_text', text: '{"type":"other","value":1}' },
     ]);
+  });
+
+  it('helper keeps nested result seams and corrects admitted image signatures', () => {
+    const content = [
+      { type: 'text', text: 'before' },
+      { type: 'tool_result', toolUseId: 'nested', content: [
+        { type: 'image', source: { ...png, mediaType: 'image/webp' } },
+        { type: 'text', text: 'between' },
+        { type: 'tool_result', toolUseId: 'deep', content: [
+          { type: 'input_image', image_url: 'data:image/webp;base64,iVBORw0KGgo=' },
+        ] },
+      ] },
+      { type: 'text', text: 'after' },
+    ];
+    const original = structuredClone(content);
+    expect(responsesToolResultOutput(content)).toEqual([
+      { type: 'input_text', text: 'before' },
+      { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
+      { type: 'input_text', text: 'between' },
+      { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
+      { type: 'input_text', text: 'after' },
+    ]);
+    expect(content).toEqual(original);
   });
 });

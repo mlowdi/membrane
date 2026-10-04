@@ -499,7 +499,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
       // also adapting Membrane and Chat Completions function schemas.
       if (rawTool?.type === 'function' && rawTool.name) return rawTool;
       if (rawTool?.type === 'function' && rawTool.function) {
-        return { type: 'function', ...rawTool.function };
+        return { type: 'function', ...rawTool.function, strict: rawTool.function.strict ?? false };
       }
       return {
         type: 'function',
@@ -510,7 +510,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           rawTool?.inputSchema ??
           rawTool?.input_schema ??
           { type: 'object', properties: {} },
-        ...(rawTool?.strict !== undefined ? { strict: rawTool.strict } : {}),
+        strict: rawTool?.strict ?? false,
       };
     });
   }
