@@ -1,4 +1,4 @@
-import type { ContentBlock, ImageContent } from '../types/content.js';
+import type { ContentBlock, ImageContent, GeneratedImageContent } from '../types/content.js';
 import { isAcceptedImageMediaType, resolveImageMediaType } from './image-media.js';
 
 export const IMAGE_TOKEN_ESTIMATE = 1600;
@@ -6,6 +6,7 @@ export const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 export const IMAGE_DROPPED_TEXT = '[image dropped from live context]';
 export const IMAGE_UNAVAILABLE_TEXT = '[image unavailable: invalid or unsupported image source/MIME]';
 export const RESPONSES_ITEMS_KEY = 'openaiResponsesItems';
+export const ASSISTANT_GENERATED_IMAGE_ORIGIN_TEXT = 'prior assistant-generated visual context; not user authorship or a new user request';
 
 /** Zero disables a dimension. Omitted bytes use the shared 20 MiB wall;
  * omitted count/depth are unlimited. The estimator is local, never a wire field. */
@@ -18,11 +19,40 @@ export interface LiveImagePolicy {
 
 type Item = Record<string, unknown>;
 type ImageMessage = { content: ContentBlock[]; metadata?: Record<string, unknown> };
-type ImageReference = { type: 'blob_ref'; ref: { originalType: 'image'; hash: string }; encodedBytes?: number; tokenEstimate?: number };
-type PolicyImage = ImageContent | ImageReference;
-const imageReference = (value: unknown): value is ImageReference => object(value) && value.type === 'blob_ref' &&
-  object(value.ref) && value.ref.originalType === 'image';
+type ImageReference = { type: 'blob_ref'; ref: { originalType: 'image' | 'generated_image'; hash: string }; encodedBytes?: number; tokenEstimate?: number };
+/** Legacy inline diagnostics only: not a producer block or inference input. */
+export type GeneratedImageMetadata = Omit<GeneratedImageContent, 'data'> & {
+  metadataOnly: true;
+  encodedBytes: number;
+};
+type PolicyImage = ImageContent | GeneratedImageContent | GeneratedImageMetadata | ImageReference;
 const object = (value: unknown): value is Item => !!value && typeof value === 'object' && !Array.isArray(value);
+export const isVisualImageContent = (value: unknown): value is ImageContent | GeneratedImageContent =>
+  object(value) && (value.type === 'image' || value.type === 'generated_image');
+export const isGeneratedImageMetadata = (value: unknown): value is GeneratedImageMetadata => object(value) &&
+  value.type === 'generated_image' && value.metadataOnly === true && typeof value.encodedBytes === 'number' &&
+  !Object.hasOwn(value, 'data');
+export const isImageReference = (value: unknown): value is ImageReference => object(value) && value.type === 'blob_ref' &&
+  object(value.ref) && (value.ref.originalType === 'image' || value.ref.originalType === 'generated_image');
+
+/** Recognized recursive tool media only; opaque carriers and arbitrary fields stay opaque. */
+export function hasVisualImageContent(content: readonly unknown[]): boolean {
+  for (const block of content) {
+    if (isVisualImageContent(block) || isImageReference(block)) return true;
+    if (object(block) && block.type === 'tool_result' && Array.isArray(block.content) &&
+        hasVisualImageContent(block.content)) return true;
+  }
+  return false;
+}
+
+/** Wire-only view of an admitted image. The encoded string and raw carrier are
+ * shared, never decoded/copied or written back over the public generated variant. */
+export function asImageContent(image: ImageContent | GeneratedImageContent): ImageContent {
+  if (image.type === 'image') return image;
+  return { type: 'image', source: { type: 'base64', data: image.data, mediaType: image.mimeType },
+    ...(image.tokenEstimate !== undefined ? { tokenEstimate: image.tokenEstimate } : {}),
+    ...(image.rawItem !== undefined ? { rawItem: image.rawItem } : {}) };
+}
 /** Reject nonalphabet characters and illegal padding/length before a
  * permissive decoder can replace the source. RFC 4648 §3.5 does not require
  * rejecting unused pad bits; previously decodable image bytes remain valid. */
@@ -35,7 +65,7 @@ export function isValidImageBase64(data: string): boolean {
  * a MIME from a missing field or serialize invalid image bytes as text. */
 export function normalizeImageContent(block: Record<string, unknown>): ContentBlock {
   if (block.type === 'input_image') return responsesImageContent(block);
-  const source = object(block.source) ? block.source : undefined;
+  const source = block.type !== 'generated_image' && object(block.source) ? block.source : undefined;
   if (source?.type === 'url' && typeof source.url === 'string' && source.url) {
     if (source.url.startsWith('data:')) {
       const image = responsesImageContent({ image_url: source.url });
@@ -49,6 +79,7 @@ export function normalizeImageContent(block: Record<string, unknown>): ContentBl
   if ((!source || source.type === 'base64') && typeof data === 'string' && isValidImageBase64(data) &&
       typeof mime === 'string' && isAcceptedImageMediaType(mime)) {
     const mediaType = resolveImageMediaType(data, mime)!;
+    if (block.type === 'generated_image') return (block.mimeType === mediaType ? block : { ...block, mimeType: mediaType }) as unknown as GeneratedImageContent;
     if (block.type === 'image' && source?.mediaType === mediaType) return block as unknown as ImageContent;
     return { type: 'image', source: { type: 'base64', data, mediaType },
       ...(typeof block.tokenEstimate === 'number' ? { tokenEstimate: block.tokenEstimate } : {}),
@@ -63,6 +94,8 @@ export function imagePayloadBytes(image: PolicyImage): number {
     if (image.encodedBytes === undefined) throw new Error('Unresolved image has no known encoded-byte cost');
     return image.encodedBytes;
   }
+  if (isGeneratedImageMetadata(image)) return image.encodedBytes;
+  if (image.type === 'generated_image') return image.data.length;
   if (image.source.type === 'base64') return image.source.data.length;
   const url = image.source.url;
   const comma = url.startsWith('data:') ? url.indexOf(',') : -1;
@@ -97,10 +130,28 @@ export function projectResponsesContent(content: unknown): ContentBlock[] {
   });
 }
 
+/** Existing native producer only. An omitted OUTPUT format is not the request
+ * default: require a supported explicit format or a recognized raster signature. */
+export function projectResponsesGeneratedImage(item: Item): GeneratedImageContent | undefined {
+  if (item.type !== 'image_generation_call' || item.status !== 'completed' ||
+      typeof item.result !== 'string' || !isValidImageBase64(item.result)) return undefined;
+  const format = item.output_format;
+  const declared = format === 'png' ? 'image/png' : format === 'jpeg' ? 'image/jpeg'
+    : format === 'webp' ? 'image/webp' : undefined;
+  if (format !== undefined && format !== null && declared === undefined) return undefined;
+  const mimeType = resolveImageMediaType(item.result, declared);
+  if (!isAcceptedImageMediaType(mimeType)) return undefined;
+  return { type: 'generated_image', data: item.result, mimeType: mimeType!, rawItem: item };
+}
+
 /** Lossless carriers for primary replay, typed projections for auxiliary calls. */
 export function projectResponsesItem(item: Item): ContentBlock[] {
   const carry = (block: ContentBlock): ContentBlock => ({ ...block, rawItem: item });
   switch (item.type) {
+    case 'image_generation_call': {
+      const image = projectResponsesGeneratedImage(item);
+      return [image ?? carry({ type: 'text', text: '' })];
+    }
     case 'message': return projectResponsesContent(item.content).map(carry);
     case 'function_call_output': return [carry({ type: 'tool_result', toolUseId: String(item.call_id ?? ''),
       content: typeof item.output === 'string' ? item.output : projectResponsesContent(item.output) })];
@@ -128,6 +179,7 @@ export function sameResponsesItem(a: unknown, b: unknown): boolean {
 }
 
 function mediaParts(item: Item): unknown[] | undefined {
+  if (projectResponsesGeneratedImage(item)) return [item];
   const parts = item.type === 'function_call_output' ? item.output : item.type === 'message' ? item.content : undefined;
   return Array.isArray(parts) && parts.some(p => object(p) && p.type === 'input_image') ? parts : undefined;
 }
@@ -149,7 +201,7 @@ export function projectNativeImageContent(message: ImageMessage): ContentBlock[]
     let end = i + 1;
     while (end < message.content.length && sameResponsesItem(message.content[end]!.rawItem, raw)) end++;
     // Already typed: keep the original blocks, including token estimates.
-    const typed = message.content.slice(i, end).some(b => b.type === 'image' ||
+    const typed = message.content.slice(i, end).some(b => isVisualImageContent(b) ||
       (b.type === 'tool_result' && Array.isArray(b.content)));
     if (typed) result?.push(...message.content.slice(i, end));
     else {
@@ -161,7 +213,10 @@ export function projectNativeImageContent(message: ImageMessage): ContentBlock[]
   return result ?? message.content;
 }
 
-function mapNativeImages(item: Item, keep: (image: ImageContent) => boolean): Item {
+function mapNativeImages(item: Item, keep: (image: ImageContent | GeneratedImageContent) => boolean): Item {
+  const generated = projectResponsesGeneratedImage(item);
+  if (generated) return keep(generated) ? item : { type: 'message', role: 'assistant',
+    content: [{ type: 'output_text', text: IMAGE_DROPPED_TEXT }] };
   const parts = mediaParts(item);
   if (!parts) return item;
   let mapped: unknown[] | undefined;
@@ -196,11 +251,14 @@ function mapContentImages(content: ContentBlock[], keep: (image: PolicyImage) =>
       continue;
     }
     let next = block;
-    if (block.type === 'image') {
+    if (isGeneratedImageMetadata(block)) {
+      if (!isAcceptedImageMediaType(block.mimeType)) next = { type: 'text', text: IMAGE_UNAVAILABLE_TEXT };
+      else if (!keep(block)) next = { type: 'text', text: IMAGE_DROPPED_TEXT };
+    } else if (isVisualImageContent(block)) {
       const image = normalizeImageContent(block as unknown as Item);
-      if (image.type !== 'image') next = image;
+      if (!isVisualImageContent(image)) next = image;
       else if (!keep(image)) next = { type: 'text', text: IMAGE_DROPPED_TEXT };
-    } else if (imageReference(block) && !keep(block)) next = { type: 'text', text: IMAGE_DROPPED_TEXT };
+    } else if (isImageReference(block) && !keep(block)) next = { type: 'text', text: IMAGE_DROPPED_TEXT };
     else if (block.type === 'tool_result' && Array.isArray(block.content)) {
       const nested = mapContentImages(block.content, keep);
       if (nested !== block.content) {
@@ -220,7 +278,7 @@ function mapContentImages(content: ContentBlock[], keep: (image: PolicyImage) =>
 export function estimateImagePolicyContentTokens(content: ContentBlock[]): number {
   let tokens = 0;
   for (const b of content) {
-    if (b.type === 'image' || imageReference(b)) tokens += b.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE;
+    if (isVisualImageContent(b) || isImageReference(b)) tokens += b.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE;
     else if (b.type === 'text') tokens += Math.ceil(b.text.length / 4);
     else if (b.type === 'thinking') tokens += Math.max(Math.ceil(b.thinking.length / 4), Math.round((b.signature?.length ?? 0) / 6));
     else if (b.type === 'redacted_thinking') tokens += Math.round(b.data.length / 6);

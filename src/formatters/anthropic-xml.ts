@@ -29,6 +29,8 @@ import type {
 import {
   parseToolCalls as parseToolCallsXml,
   formatToolResults as formatToolResultsXml,
+  formatToolResultsForSplitTurn,
+  hasImageInToolResults,
   parseAccumulatedIntoBlocks,
   formatToolDefinitions,
   toolDefinitionForPrompt,
@@ -36,6 +38,7 @@ import {
 import { IncrementalXmlParser } from '../utils/stream-parser.js';
 import { assertCacheMarkersWithinLimit, clampCacheMarkers } from '../utils/cache-marker-budget.js';
 import { lastCacheableBlockIndex } from './native.js';
+import { normalizeImageContent, isVisualImageContent, asImageContent } from '../utils/image-policy.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
 
 // ============================================================================
@@ -82,32 +85,13 @@ export interface AnthropicXmlFormatterConfig extends FormatterConfig {
 // Helpers
 // ============================================================================
 
-/**
- * Convert a stored tool_result content block into a ToolResult for XML
- * re-rendering (legacy path — blocks without rawXml). Only text and base64
- * image sub-blocks survive; other block types have no XML representation.
- */
+/** Hand typed results to the shared recursive XML media renderer. Unknown
+ * block kinds stay archival; the renderer emits only supported visual/text. */
 function toToolResult(block: ToolResultContent): ToolResult {
-  let content: string | ToolResultContentBlock[];
-  if (typeof block.content === 'string') {
-    content = block.content;
-  } else {
-    content = [];
-    for (const sub of block.content) {
-      if (sub.type === 'text') {
-        content.push({ type: 'text', text: sub.text });
-      } else if (sub.type === 'image' && sub.source.type === 'base64') {
-        content.push({
-          type: 'image',
-          source: { type: 'base64', data: sub.source.data, mediaType: sub.source.mediaType },
-        });
-      }
-    }
-  }
   return {
     toolUseId: block.toolUseId,
     toolName: block.toolName,
-    content,
+    content: block.content as string | ToolResultContentBlock[],
     isError: block.isError ?? false,
   };
 }
@@ -260,8 +244,25 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
       const isLastMessage = i === messages.length - 1;
       const isAssistant = message.participant === assistantParticipant;
 
+      // Typed visual results replay through the same split used for live
+      // injection: assistant XML prefix, ordered user media, assistant suffix.
+      // Tool results remain harness injection rather than participant speech.
+      const isPureToolResults = message.content.length > 0 && message.content.every(c => c.type === 'tool_result');
+      if (isPureToolResults) {
+        const results = (message.content as ToolResultContent[]).map(toToolResult);
+        if (hasImageInToolResults(results)) {
+          const split = formatToolResultsForSplitTurn(results);
+          currentConversation.push(split.beforeImageXml);
+          providerMessages.push({ role: 'assistant', content: currentConversation.join(joiner) });
+          currentConversation = [split.afterImageXml + this.config.messageDelimiter];
+          providerMessages.push({ role: 'user', content: split.userContent });
+          lastWasToolResults = true;
+          continue;
+        }
+      }
+
       // Extract content
-      const { text, images, hasUnsupportedMedia } = this.extractContent(message.content, message.participant);
+      const { text, images, orderedContent, hasUnsupportedMedia } = this.extractContent(message.content, message.participant);
       const hasImages = images.length > 0;
       const isEmpty = !text.trim() && !hasImages;
 
@@ -288,10 +289,11 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
         }
 
         const userContent: unknown[] = [];
-        if (text) {
-          userContent.push({ type: 'text', text: `${message.participant}: ${text}` });
+        if (orderedContent) userContent.push({ type: 'text', text: `${message.participant}:` }, ...orderedContent);
+        else {
+          if (text) userContent.push({ type: 'text', text: `${message.participant}: ${text}` });
+          userContent.push(...images);
         }
-        userContent.push(...images);
 
         providerMessages.push({ role: 'user', content: userContent });
         lastNonEmptyParticipant = message.participant;
@@ -334,9 +336,6 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
       // Check bot continuation
       const isBotMessage = message.participant === assistantParticipant;
       const isContinuation = isBotMessage && lastNonEmptyParticipant === assistantParticipant && !hasToolResult;
-
-      const isPureToolResults =
-        hasToolResult && message.content.every((c) => c.type === 'tool_result');
 
       if (isContinuation && isLastMessage) {
         // Bot continuation - don't add prefix
@@ -512,29 +511,43 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
   private extractContent(
     content: ContentBlock[],
     participant: string
-  ): { text: string; images: unknown[]; hasUnsupportedMedia: boolean } {
+  ): { text: string; images: unknown[]; orderedContent?: unknown[]; hasUnsupportedMedia: boolean } {
     const parts: string[] = [];
     const images: unknown[] = [];
+    // Retain the canonical direct-image layout. Generated mixed media and
+    // typed result media need their original alternating part order.
+    const orderedContent: unknown[] | undefined = content.some(block => block.type === 'generated_image' ||
+      (block.type === 'tool_result' && hasImageInToolResults([toToolResult(block)]))) ? [] : undefined;
     let hasUnsupportedMedia = false;
 
     for (let i = 0; i < content.length; i++) {
       const block = content[i]!;
       if (block.type === 'text') {
         parts.push(block.text);
-      } else if (block.type === 'image') {
-        if (block.source.type === 'base64') {
-          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
+        orderedContent?.push({ type: 'text', text: block.text });
+      } else if (isVisualImageContent(block)) {
+        // Retain provider-oriented canonical XML detection. Generated outputs
+        // still require the valid declared-MIME floor of their shared policy.
+        const visual = block.type === 'generated_image'
+          ? normalizeImageContent(block as unknown as Record<string, unknown>) : block;
+        if (!isVisualImageContent(visual)) {
+          if (visual.type === 'text') {
+            parts.push(visual.text);
+            orderedContent?.push(visual);
+          }
+          continue;
+        }
+        const image = asImageContent(visual);
+        if (image.source.type === 'base64') {
+          const mediaType = resolveImageMediaType(image.source.data, image.source.mediaType);
           if (!isAcceptedImageMediaType(mediaType)) {
-            parts.push(strippedImagePlaceholder(mediaType).text);
+            const unavailable = strippedImagePlaceholder(mediaType);
+            parts.push(unavailable.text);
+            orderedContent?.push(unavailable);
           } else {
-            images.push({
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: mediaType,
-                data: block.source.data,
-              },
-            });
+            const part = { type: 'image', source: { type: 'base64', media_type: mediaType, data: image.source.data } };
+            images.push(part);
+            orderedContent?.push(part);
           }
         }
       } else if (block.type === 'tool_use') {
@@ -546,7 +559,9 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
           i++;
         }
         i--;
-        parts.push(...this.renderToolUseRun(run));
+        const rendered = this.renderToolUseRun(run);
+        parts.push(...rendered);
+        if (orderedContent) for (const text of rendered) orderedContent.push({ type: 'text', text });
       } else if (block.type === 'tool_result') {
         const run: ToolResultContent[] = [];
         while (i < content.length && content[i]!.type === 'tool_result') {
@@ -554,13 +569,29 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
           i++;
         }
         i--;
-        parts.push(...this.renderToolResultRun(run));
+        const results = run.map(toToolResult);
+        if (orderedContent && hasImageInToolResults(results)) {
+          const split = formatToolResultsForSplitTurn(results);
+          parts.push(split.beforeImageXml);
+          orderedContent.push({ type: 'text', text: split.beforeImageXml });
+          for (const part of split.userContent) {
+            orderedContent.push(part);
+            if (part.type === 'image') images.push(part);
+            else parts.push(part.text);
+          }
+          parts.push(split.afterImageXml);
+          orderedContent.push({ type: 'text', text: split.afterImageXml });
+        } else {
+          const rendered = this.renderToolResultRun(run);
+          parts.push(...rendered);
+          if (orderedContent) for (const text of rendered) orderedContent.push({ type: 'text', text });
+        }
       } else if (block.type === 'document' || block.type === 'audio') {
         hasUnsupportedMedia = true;
       }
     }
 
-    return { text: parts.join('\n'), images, hasUnsupportedMedia };
+    return { text: parts.join('\n'), images, orderedContent, hasUnsupportedMedia };
   }
 
   /**

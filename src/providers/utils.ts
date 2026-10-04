@@ -221,18 +221,30 @@ function carriesInlineImageData(block: unknown): boolean {
   return !!source && typeof source === 'object' && typeof source.data === 'string';
 }
 
+function redactInlineToolResultImages(content: unknown[]): unknown[] {
+  let result: unknown[] | undefined;
+  for (let index = 0; index < content.length; index++) {
+    const block = content[index];
+    let next = block;
+    if (carriesInlineImageData(block)) {
+      next = { type: 'text', text: TEXT_ONLY_TOOL_RESULT_IMAGE_PLACEHOLDER };
+    } else if (block && typeof block === 'object' && 'type' in block && block.type === 'tool_result' &&
+        'content' in block && Array.isArray(block.content)) {
+      const nested = redactInlineToolResultImages(block.content);
+      if (nested !== block.content) {
+        // These carriers describe the unredacted media; they never enter this text-only projection.
+        const { rawItem: _rawItem, rawXml: _rawXml, ...rest } = block as Record<string, unknown>;
+        next = { ...rest, content: nested };
+      }
+    }
+    if (next !== block) { result ??= content.slice(); result[index] = next; }
+  }
+  return result ?? content;
+}
+
 export function textOnlyToolResultContent(content: unknown): string {
   if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return JSON.stringify(content);
-  let replaced = false;
-  const blocks = content.map((block) => {
-    if (carriesInlineImageData(block)) {
-      replaced = true;
-      return { type: 'text', text: TEXT_ONLY_TOOL_RESULT_IMAGE_PLACEHOLDER };
-    }
-    return block;
-  });
-  return JSON.stringify(replaced ? blocks : content);
+  return JSON.stringify(Array.isArray(content) ? redactInlineToolResultImages(content) : content);
 }
 
 /**

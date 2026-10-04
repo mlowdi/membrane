@@ -11,6 +11,7 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeResponsesInput } from './responses-input.js';
+import { projectResponsesGeneratedImage } from '../utils/image-policy.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
 
 import type {
@@ -548,7 +549,10 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     const content: OpenAIResponsesAPIContentBlock[] = [];
 
     items.forEach((item, outputIndex) => {
-      if (item.type === 'message') {
+      const generated = projectResponsesGeneratedImage(item);
+      if (generated) {
+        content.push({ ...generated, itemId: item.id, outputIndex, rawItem: item });
+      } else if (item.type === 'message') {
         const phase = this.asPhase(item.phase);
         const messageContent = Array.isArray(item.content) ? item.content : [];
         messageContent.forEach((part: any, contentIndex: number) => {

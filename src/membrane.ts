@@ -673,8 +673,8 @@ export class Membrane {
     const executedToolResults: ToolResult[] = [];
 
     // Track non-text content blocks from provider (e.g., generated_image from Gemini)
-    // These can't be handled by the text-based XML parser, so we capture and append them
-    const extraContentBlocks: ContentBlock[] = [];
+    // These stay out of XML text; source anchors retain their final document order
+    const extraContentBlocks: Array<{ offset: number; block: ContentBlock }> = [];
 
     // Native thinking blocks from the provider (with signatures). The parser
     // derives signature-less thinking blocks from <thinking> text (via
@@ -858,7 +858,7 @@ export class Membrane {
         // Capture non-text content blocks from provider response (e.g., generated_image from Gemini)
         // The XML parser only handles text — binary content blocks need to be preserved separately
         if (Array.isArray(streamResult.content)) {
-          this.captureProviderImageBlocks(streamResult.content, extraContentBlocks);
+          this.captureProviderImageBlocks(streamResult.content, extraContentBlocks, checkFromIndex - initialPrefillLength);
           // Native thinking blocks carry the signature (encrypted full
           // reasoning) — captured so consumers can persist and round-trip
           // them for reasoning continuity.
@@ -1208,12 +1208,8 @@ export class Membrane {
         executedToolResults,
         initialBlockType,
         lastStopSequence,
+        extraContentBlocks,
       );
-
-      // Append non-text content blocks (e.g., generated_image) that the XML parser can't handle
-      if (extraContentBlocks.length > 0) {
-        response.content.push(...extraContentBlocks);
-      }
 
       // Merge provider thinking signatures into parser-derived thinking blocks
       this.mergeProviderThinkingBlocks(response.content, providerThinkingBlocks);
@@ -1905,11 +1901,7 @@ export class Membrane {
         } else if (item.type === 'image') {
           blocks.push({ ...item } as ContentBlock);
         } else if (item.type === 'generated_image') {
-          blocks.push({
-            type: 'generated_image',
-            data: item.data,
-            mimeType: item.mimeType,
-          });
+          blocks.push({ ...item } as ContentBlock);
         } else if (item.rawItem || item.type) {
           // Opaque Responses items such as encrypted compaction or custom
           // tool records have no normalized ContentBlock equivalent. Retain a
@@ -1940,11 +1932,17 @@ export class Membrane {
   }
 
   /** Retain image blocks that the XML text parser cannot represent. */
-  private captureProviderImageBlocks(providerContent: unknown, sink: ContentBlock[]): void {
+  private captureProviderImageBlocks(providerContent: unknown,
+    sink: Array<{ offset: number; block: ContentBlock }>, offset: number): void {
     if (!Array.isArray(providerContent)) return;
     for (const block of providerContent) {
       if (block?.type === 'image' || block?.type === 'generated_image') {
-        sink.push({ ...block } as ContentBlock);
+        sink.push({ offset, block: { ...block } as ContentBlock });
+      } else if (block?.type === 'text' && typeof block.text === 'string') offset += block.text.length;
+      else if (block?.type === 'thinking' && typeof block.thinking === 'string') {
+        // XML streams request wrapThinkingTags; the tags also occupy source
+        // positions, but signatures/opaque native carriers never become text.
+        offset += '<thinking>'.length + block.thinking.length + '</thinking>'.length;
       }
     }
   }
@@ -2610,11 +2608,7 @@ export class Membrane {
         } else if (block.type === 'image') {
           content.push({ ...block } as ContentBlock);
         } else if (block.type === 'generated_image') {
-          content.push({
-            type: 'generated_image',
-            data: block.data,
-            mimeType: block.mimeType,
-          });
+          content.push({ ...block } as ContentBlock);
         }
       }
     } else if (typeof providerResponse.content === 'string') {
@@ -2778,6 +2772,7 @@ export class Membrane {
     executedToolResults: ToolResult[] = [],
     startInsideBlock: 'thinking' | 'tool_call' | 'tool_result' | null = null,
     triggeredSequence?: string,
+    mediaBlocks?: ReadonlyArray<{ offset: number; block: ContentBlock }>,
   ): NormalizedResponse {
     const usage = turnUsage.total;
     // Parse accumulated text into structured content blocks
@@ -2799,6 +2794,7 @@ export class Membrane {
       // can correctly handle closing tags without corresponding opening tags
       const parseOptions = {
         tools: request.tools,
+        mediaBlocks,
         ...(startInsideBlock ? { startInsideBlock } : {}),
       };
       const parsed = parseAccumulatedIntoBlocks(accumulated, parseOptions);
@@ -3210,7 +3206,7 @@ export class Membrane {
     let rawResponse: unknown;
 
     // The text parser cannot carry images. Retain them across all rounds.
-    const extraContentBlocks: ContentBlock[] = [];
+    const extraContentBlocks: Array<{ offset: number; block: ContentBlock }> = [];
 
     // Native thinking blocks from the provider (with signatures) — merged
     // into the parser-derived content before the final response is emitted.
@@ -3370,7 +3366,7 @@ export class Membrane {
           streamResult.stopSequence = detectedStopSequence;
         }
 
-        this.captureProviderImageBlocks(streamResult.content, extraContentBlocks);
+        this.captureProviderImageBlocks(streamResult.content, extraContentBlocks, checkFromIndex - initialPrefillLength);
 
         // Capture native thinking blocks (with signatures) from the provider
         // response — the text parser can't see signatures, so they're merged
@@ -3727,12 +3723,12 @@ export class Membrane {
         executedToolResults,
         initialBlockType,
         lastStopSequence,
+        extraContentBlocks,
       );
 
       // Merge provider thinking signatures into parser-derived thinking blocks
       this.mergeProviderThinkingBlocks(response.content, providerThinkingBlocks);
 
-      response.content.push(...extraContentBlocks);
       response.details.timing.rounds = rounds;
 
       stream.emit({ type: 'complete', response });

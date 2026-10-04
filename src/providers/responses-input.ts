@@ -1,6 +1,7 @@
-import type { ProviderRequest } from '../types/index.js';
+import type { ImageContent, ProviderRequest } from '../types/index.js';
 import type { OpenAIResponsesInputItem } from './openai-responses-api.js';
-import { normalizeImageContent, IMAGE_UNAVAILABLE_TEXT } from '../utils/image-policy.js';
+import { normalizeImageContent, IMAGE_UNAVAILABLE_TEXT, isVisualImageContent, asImageContent, ASSISTANT_GENERATED_IMAGE_ORIGIN_TEXT,
+  projectResponsesGeneratedImage, sameResponsesItem } from '../utils/image-policy.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -27,7 +28,7 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
     // Native messages (including phase, status and developer/system roles)
     // must survive replay verbatim. Only translate normalized content blocks.
     if (Array.isArray(rawMessage.content) && !rawMessage.content.some((block) =>
-      isObject(block) && ['text', 'image', 'tool_use', 'tool_result', 'redacted_thinking'].includes(asString(block.type))
+      isObject(block) && ['text', 'image', 'generated_image', 'tool_use', 'tool_result', 'redacted_thinking'].includes(asString(block.type))
     )) {
       output.push(rawMessage);
       continue;
@@ -39,6 +40,7 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
         ? [{ type: 'text', text: rawMessage.content }]
         : [];
     let parts: unknown[] = [];
+    let seenRawItems: JsonObject[] | undefined;
     const flush = () => {
       if (parts.length === 0) return;
       output.push({
@@ -54,11 +56,26 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
       if (!isObject(rawBlock)) continue;
       if (rawBlock.type === 'text') {
         parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: asString(rawBlock.text) });
-      } else if (rawBlock.type === 'image') {
-        const imageUrl = responsesImageUrl(rawBlock);
-        if (role !== 'assistant') parts.push(imageUrl
-          ? { type: 'input_image', image_url: imageUrl }
-          : { type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT });
+      } else if (isVisualImageContent(rawBlock)) {
+        const visual = normalizeImageContent(rawBlock);
+        if (visual.type === 'generated_image' && isObject(visual.rawItem) && projectResponsesGeneratedImage(visual.rawItem)) {
+          flush();
+          const rawItem = visual.rawItem;
+          const seen = seenRawItems?.some(item => typeof rawItem.id === 'string'
+            ? item.type === rawItem.type && item.id === rawItem.id : sameResponsesItem(item, rawItem));
+          if (!seen) { output.push(rawItem); (seenRawItems ??= []).push(rawItem); }
+          continue;
+        }
+        const imageUrl = isVisualImageContent(visual) ? admittedImageUrl(asImageContent(visual)) : undefined;
+        const part = imageUrl ? { type: 'input_image', image_url: imageUrl }
+          : { type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT };
+        if (role !== 'assistant') parts.push(part);
+        else if (rawBlock.type === 'generated_image') {
+          flush();
+          output.push({ type: 'message', role: 'user', content: [
+            { type: 'input_text', text: ASSISTANT_GENERATED_IMAGE_ORIGIN_TEXT }, part,
+          ] });
+        }
       } else if (rawBlock.type === 'tool_use') {
         flush();
         output.push(normalizeStandaloneItem(rawBlock));
@@ -92,7 +109,7 @@ export function responsesToolResultOutput(content: unknown): string | JsonObject
         const nested = responsesToolResultOutput(block.content);
         return typeof nested === 'string' ? [{ type: 'input_text', text: nested }] : nested;
       }
-      if (block.type === 'image' || block.type === 'input_image') {
+      if (isVisualImageContent(block) || block.type === 'input_image') {
         const imageUrl = responsesImageUrl(block);
         return [imageUrl ? { type: 'input_image', image_url: imageUrl }
           : { type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT }];
@@ -140,8 +157,12 @@ function reasoningInputItem(block: JsonObject): unknown {
 }
 
 function responsesImageUrl(block: JsonObject): string | undefined {
-  const image = normalizeImageContent(block);
-  if (image.type !== 'image') return undefined;
+  const visual = normalizeImageContent(block);
+  if (!isVisualImageContent(visual)) return undefined;
+  return admittedImageUrl(asImageContent(visual));
+}
+
+function admittedImageUrl(image: ImageContent): string {
   return image.source.type === 'url' ? image.source.url
     : `data:${image.source.mediaType};base64,${image.source.data}`;
 }

@@ -19,7 +19,7 @@ import type {
   ToolDefinition,
 } from '../types/index.js';
 import { createHash } from 'node:crypto';
-import { normalizeImageContent } from './image-policy.js';
+import { normalizeImageContent, isVisualImageContent, asImageContent } from './image-policy.js';
 import { readToolSchema, type ParameterDeclaration, type ToolSchemaReading } from './tool-schema.js';
 
 // ============================================================================
@@ -602,7 +602,10 @@ function* toolResultContentLeaves(content: string | ToolResultContentBlock[]): G
   }
   for (const block of content) {
     if (block.type === 'tool_result') yield* toolResultContentLeaves(block.content);
-    else if (block.type === 'image') yield normalizeImageContent(block as unknown as Record<string, unknown>);
+    else if (isVisualImageContent(block)) {
+      const visual = normalizeImageContent(block as unknown as Record<string, unknown>);
+      yield isVisualImageContent(visual) ? asImageContent(visual) : visual;
+    }
     else yield block;
   }
 }
@@ -951,7 +954,8 @@ const LEGACY_ERROR_REGEX = /<error>\n?([\s\S]*?)\n?<\/error>/g;
  */
 export function parseAccumulatedIntoBlocks(
   text: string,
-  options?: ToolParseOptions & { startInsideBlock?: 'thinking' | 'tool_call' | 'tool_result' }
+  options?: ToolParseOptions & { startInsideBlock?: 'thinking' | 'tool_call' | 'tool_result';
+    mediaBlocks?: ReadonlyArray<{ offset: number; block: ContentBlock }> }
 ): {
   blocks: ContentBlock[];
   toolCalls: ToolCall[];
@@ -1186,7 +1190,17 @@ export function parseAccumulatedIntoBlocks(
     }
   }
 
-  // Survivors are already in document order, so positions are too.
+  // Provider visuals never enter XML text or change stream events. Retain
+  // their source offsets in the final normalized document, including multiple
+  // preview/final blocks at the same position (no deduplication).
+  if (options?.mediaBlocks?.length) {
+    const prefixLength = processedText.length - text.length;
+    for (const media of options.mediaBlocks) {
+      const offset = Math.max(0, Math.min(text.length, media.offset)) + prefixLength;
+      positions.push({ start: offset, end: offset, block: media.block });
+    }
+    positions.sort((a, b) => a.start - b.start);
+  }
   for (const pos of positions) {
     if (pos.calls) toolCalls.push(...pos.calls);
     if (pos.results) toolResults.push(...pos.results);

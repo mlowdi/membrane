@@ -245,11 +245,9 @@ export class GeminiAdapter implements ProviderAdapter {
       }
 
       const decoder = new TextDecoder();
-      let accumulated = '';
+      const content: ContentBlock[] = [];
       let finishReason = 'STOP';
       let sawTerminalEvent = false;
-      let toolCalls: { name: string; args: Record<string, unknown> }[] = [];
-      let images: { data: string; mimeType: string }[] = [];
       let lastUsage: GeminiResponse['usageMetadata'] | undefined;
       // The resolved model Google actually served, echoed on stream frames.
       // Reporting the requested id instead hides alias/auto-upgrade routing.
@@ -273,22 +271,8 @@ export class GeminiAdapter implements ProviderAdapter {
 
         if (candidate?.content?.parts) {
           for (const part of candidate.content.parts) {
-            if (part.text) {
-              accumulated += part.text;
-              callbacks.onChunk(part.text);
-            }
-            if (part.inlineData) {
-              images.push({
-                data: part.inlineData.data,
-                mimeType: part.inlineData.mimeType,
-              });
-            }
-            if (part.functionCall) {
-              toolCalls.push({
-                name: part.functionCall.name,
-                args: part.functionCall.args,
-              });
-            }
+            this.appendContentPart(content, part);
+            if (part.text) callbacks.onChunk(part.text);
           }
         }
 
@@ -335,7 +319,7 @@ export class GeminiAdapter implements ProviderAdapter {
       assertTerminalEventObserved(sawTerminalEvent, 'Gemini', geminiRequest);
 
       return {
-        content: this.buildContentBlocks(accumulated, toolCalls, images),
+        content,
         stopReason: this.mapFinishReason(finishReason),
         stopSequence: undefined,
         usage: geminiUsageToProviderUsage(lastUsage),
@@ -577,28 +561,11 @@ export class GeminiAdapter implements ProviderAdapter {
     const candidate = response.candidates?.[0];
     const parts = candidate?.content?.parts ?? [];
 
-    let text = '';
-    const toolCalls: { name: string; args: Record<string, unknown> }[] = [];
-    const images: { data: string; mimeType: string }[] = [];
-
-    for (const part of parts) {
-      if (part.text) text += part.text;
-      if (part.inlineData) {
-        images.push({
-          data: part.inlineData.data,
-          mimeType: part.inlineData.mimeType,
-        });
-      }
-      if (part.functionCall) {
-        toolCalls.push({
-          name: part.functionCall.name,
-          args: part.functionCall.args,
-        });
-      }
-    }
+    const content: ContentBlock[] = [];
+    for (const part of parts) this.appendContentPart(content, part);
 
     return {
-      content: this.buildContentBlocks(text, toolCalls, images),
+      content,
       stopReason: this.mapFinishReason(candidate?.finishReason),
       stopSequence: undefined,
       usage: geminiUsageToProviderUsage(response.usageMetadata),
@@ -608,35 +575,17 @@ export class GeminiAdapter implements ProviderAdapter {
     };
   }
 
-  private buildContentBlocks(
-    text: string,
-    toolCalls: { name: string; args: Record<string, unknown> }[],
-    images: { data: string; mimeType: string }[] = []
-  ): ContentBlock[] {
-    const content: ContentBlock[] = [];
-
-    if (text) {
-      content.push({ type: 'text', text });
+  private appendContentPart(content: ContentBlock[], part: GeminiPart): void {
+    if (part.text) {
+      const previous = content.at(-1);
+      if (previous?.type === 'text') previous.text += part.text;
+      else content.push({ type: 'text', text: part.text });
     }
-
-    for (const img of images) {
-      content.push({
-        type: 'generated_image',
-        data: img.data,
-        mimeType: img.mimeType,
-      } as ContentBlock);
-    }
-
-    for (const tc of toolCalls) {
-      content.push({
-        type: 'tool_use',
-        id: `gemini-tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        name: tc.name,
-        input: tc.args,
-      });
-    }
-
-    return content;
+    if (part.inlineData) content.push({ type: 'generated_image',
+      data: part.inlineData.data, mimeType: part.inlineData.mimeType, rawItem: part });
+    if (part.functionCall) content.push({ type: 'tool_use',
+      id: `gemini-tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name: part.functionCall.name, input: part.functionCall.args });
   }
 
   private mapFinishReason(reason: string | undefined): string {

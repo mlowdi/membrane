@@ -30,7 +30,7 @@ import type {
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
 import { assertCacheMarkersWithinLimit } from '../utils/cache-marker-budget.js';
-import { normalizeImageContent, projectNativeImageContent } from '../utils/image-policy.js';
+import { normalizeImageContent, projectNativeImageContent, isVisualImageContent, asImageContent } from '../utils/image-policy.js';
 
 /** Native tools and maintenance formatters share the same source conversion.
  * Content arrays are media, not JSON text. Nested result envelopes are projected
@@ -42,9 +42,10 @@ export function nativeToolResultContent(content: unknown): unknown {
     if (block.type === 'tool_result' && Array.isArray(block.content)) {
       return nativeToolResultContent(block.content) as unknown[];
     }
-    if (block.type !== 'image') return [block];
-    const image = normalizeImageContent(block);
-    if (image.type !== 'image') return [image];
+    if (!isVisualImageContent(block)) return [block];
+    const visual = normalizeImageContent(block as unknown as Record<string, unknown>);
+    if (!isVisualImageContent(visual)) return [visual];
+    const image = asImageContent(visual);
     return [{ type: 'image', source: image.source.type === 'url'
       ? image.source
       : { type: 'base64', media_type: image.source.mediaType, data: image.source.data },
@@ -447,11 +448,14 @@ export class NativeFormatter implements PrefillFormatter {
           textBlock.cache_control = block.cache_control;
         }
         result.push(textBlock);
-      } else if (block.type === 'image') {
-        const image = normalizeImageContent(block as unknown as Record<string, unknown>);
-        if (image.type !== 'image') {
-          result.push(image);
-        } else if (image.source.type === 'base64') {
+      } else if (isVisualImageContent(block)) {
+        const visual = normalizeImageContent(block as unknown as Record<string, unknown>);
+        if (!isVisualImageContent(visual)) {
+          result.push(visual);
+          continue;
+        }
+        const image = asImageContent(visual);
+        if (image.source.type === 'base64') {
           result.push({
             type: 'image',
             source: { type: 'base64', media_type: image.source.mediaType, data: image.source.data },

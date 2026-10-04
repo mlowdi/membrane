@@ -29,9 +29,15 @@ export {
   createImageMessageFilter,
   projectResponsesContent,
   normalizeImageContent,
+  isVisualImageContent,
+  hasVisualImageContent,
+  isImageReference,
+  isGeneratedImageMetadata,
+  asImageContent,
   isValidImageBase64,
   projectResponsesItem,
+  projectResponsesGeneratedImage,
   projectNativeImageContent,
   estimateImagePolicyContentTokens,
 } from './image-policy.js';
-export type { LiveImagePolicy, ImageMessageFilter } from './image-policy.js';
+export type { LiveImagePolicy, ImageMessageFilter, GeneratedImageMetadata } from './image-policy.js';

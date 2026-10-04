@@ -25,7 +25,7 @@ import type {
 import { resolveImageMediaType } from '../utils/image-media.js';
 
 import { responsesToolResultOutput } from '../providers/responses-input.js';
-import { filterImageMessages, sameResponsesItem } from '../utils/image-policy.js';
+import { filterImageMessages, sameResponsesItem, isVisualImageContent, asImageContent, projectResponsesGeneratedImage, ASSISTANT_GENERATED_IMAGE_ORIGIN_TEXT } from '../utils/image-policy.js';
 
 export const OPENAI_RESPONSES_ITEMS_METADATA_KEY = 'openaiResponsesItems';
 
@@ -102,7 +102,8 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
 
       for (const block of message.content) {
         const rawItem = block.rawItem as NativeItem | undefined;
-        if (!rawItem || typeof rawItem !== 'object') {
+        if (!rawItem || typeof rawItem !== 'object' ||
+            (block.type === 'generated_image' && !projectResponsesGeneratedImage(rawItem))) {
           pendingParts.push(block);
           continue;
         }
@@ -178,11 +179,20 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
           type: isAssistant ? 'output_text' : 'input_text',
           text: block.text,
         });
-      } else if (block.type === 'image' && !isAssistant) {
-        const source = block.source;
-        messageParts.push(source.type === 'url'
+      } else if (isVisualImageContent(block) && (!isAssistant || block.type === 'generated_image')) {
+        const source = asImageContent(block).source;
+        const part = source.type === 'url'
           ? { type: 'input_image', image_url: source.url }
-          : { type: 'input_image', image_url: `data:${resolveImageMediaType(source.data, source.mediaType)};base64,${source.data}` });
+          : { type: 'input_image', image_url: `data:${resolveImageMediaType(source.data, source.mediaType)};base64,${source.data}` };
+        if (isAssistant) {
+          // Responses assistant output has no normalized image input part.
+          // Replay a non-native generated visual as user media at this seam;
+          // authoritative raw image-generation items were handled above.
+          flushMessage();
+          out.push({ type: 'message', role: 'user', content: [
+            { type: 'input_text', text: ASSISTANT_GENERATED_IMAGE_ORIGIN_TEXT }, part,
+          ] });
+        } else messageParts.push(part);
       } else if (block.type === 'tool_use') {
         flushMessage();
         out.push({

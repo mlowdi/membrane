@@ -2,7 +2,8 @@
  * Context management types
  */
 
-import type { NormalizedMessage, NormalizedResponse, AbortedResponse, GenerationConfig, ToolDefinition } from '../types/index.js';
+import type { ContentBlock, NormalizedMessage, NormalizedResponse, AbortedResponse, GenerationConfig, ToolDefinition } from '../types/index.js';
+import { isVisualImageContent, isImageReference, hasVisualImageContent } from '../utils/image-policy.js';
 
 // ============================================================================
 // Cache Marker
@@ -292,21 +293,23 @@ export function createInitialState(): ContextState {
  * Default token estimator (chars / 4)
  */
 export function defaultTokenEstimator(message: NormalizedMessage): number {
+  return Math.ceil(contextContentChars(message.content) / 4);
+}
+
+function contextContentChars(content: readonly ContentBlock[]): number {
   let chars = 0;
-  for (const block of message.content) {
-    if (block.type === 'text') {
-      chars += block.text.length;
+  for (const block of content) {
+    if (block.type === 'text') chars += block.text.length;
+    else if (isVisualImageContent(block) || isImageReference(block)) {
+      // Preserve this public estimator's 1500-token image prior, not CM's 1600.
+      chars += 4 * (block.tokenEstimate ?? 1500);
     } else if (block.type === 'tool_result') {
-      const content = typeof block.content === 'string'
-        ? block.content
-        : JSON.stringify(block.content);
-      chars += content.length;
-    } else if (block.type === 'image') {
-      // Images: ~1500 tokens regardless of size (Anthropic)
-      chars += 6000; // 1500 * 4
+      if (typeof block.content === 'string') chars += block.content.length;
+      else if (hasVisualImageContent(block.content)) chars += contextContentChars(block.content);
+      else chars += JSON.stringify(block.content).length;
     }
   }
-  return Math.ceil(chars / 4);
+  return chars;
 }
 
 /**

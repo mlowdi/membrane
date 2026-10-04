@@ -77,6 +77,23 @@ describe('textOnlyToolResultContent', () => {
     expect(content).toEqual(original);
   });
 
+  it('falsifier: nested generated and canonical tool media never become ordinary text or native JSON', () => {
+    const opaque = { toJSON() { throw new Error('opaque carrier must not be serialized'); } };
+    const content = [{ type: 'tool_result', toolUseId: 'inner', isError: true, custom: 'preserved', rawItem: opaque, content: [
+      { type: 'text', text: 'before' }, { type: 'generated_image', data: BIG_PNG, mimeType: 'image/png', rawItem: opaque },
+      { type: 'tool_result', toolUseId: 'deeper', content: [imageBlock(), { type: 'text', text: 'after' }] }],
+    }];
+    const serialized = textOnlyToolResultContent(content);
+    expect(serialized).not.toContain(PAYLOAD_PROBE);
+    expect(serialized).toContain(TEXT_ONLY_TOOL_RESULT_IMAGE_PLACEHOLDER);
+    const nested = JSON.parse(serialized)[0];
+    expect(nested).toMatchObject({ type: 'tool_result', toolUseId: 'inner', isError: true, custom: 'preserved' });
+    expect(nested.content[0]).toEqual({ type: 'text', text: 'before' });
+    expect(nested.content[2].content[1]).toEqual({ type: 'text', text: 'after' });
+    expect(content[0].rawItem).toBe(opaque);
+    expect(content[0].content[1]).toMatchObject({ data: BIG_PNG, rawItem: opaque });
+  });
+
   it.each([
     ['URL-source image', [{ type: 'image', source: { type: 'url', url: 'https://example.com/a.png' } }]],
     ['image-typed tool data without a payload', [{ type: 'image', url: 'https://img.example/cat.jpg', title: 'Cat', width: 640 }]],

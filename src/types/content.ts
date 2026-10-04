@@ -96,6 +96,7 @@ export interface GeneratedImageContent {
   type: 'generated_image';
   data: string;
   mimeType: string;
+  tokenEstimate?: number;
   isPreview?: boolean; // Streaming: preview vs final
   /** See {@link TextContent.rawItem}. */
   rawItem?: unknown;

@@ -25,6 +25,7 @@ import {
 } from '../types/index.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
 import { assertTerminalEventObserved } from './utils.js';
+import { normalizeImageContent } from '../utils/image-policy.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
 import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
 
@@ -1048,19 +1049,15 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
         });
         break;
 
-      case 'generated_image':
-        // A provider-generated image is a base64 image with a MIME type, which
-        // is exactly Anthropic's image block — carrying it across costs nothing
-        // and lets an image Gemini produced re-enter Anthropic history.
-        result.push({
-          type: 'image',
-          source: {
-            type: 'base64',
-            media_type: block.mimeType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
-            data: block.data,
-          },
-        });
+      case 'generated_image': {
+        const image = normalizeImageContent(block as unknown as Record<string, unknown>);
+        if (image.type === 'generated_image') result.push({ type: 'image', source: {
+          type: 'base64', media_type: image.mimeType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+          data: image.data,
+        } });
+        else if (image.type === 'text') result.push({ type: 'text', text: image.text });
         break;
+      }
         
       case 'tool_use':
         result.push({
