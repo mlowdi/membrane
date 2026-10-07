@@ -44,6 +44,45 @@ async function rejectionFrom(streaming: Promise<unknown>): Promise<unknown> {
   throw new Error('expected the stream to reject');
 }
 
+describe('trusted cyber_policy frame signal', () => {
+  it('preserves only the exact own structured code as non-retryable safety', () => {
+    const error = throwsFromFrame({ code: 'cyber_policy', status: 503, message: 'Disposable provider prose.' }, zzRequest) as MembraneError;
+    expect(error).toBeInstanceOf(MembraneError);
+    expect(classifyError(error)).toMatchObject({ type: 'safety', retryable: false, providerErrorCode: 'cyber_policy' });
+    expect(error.httpStatus).toBeUndefined(); expect(error.rawRequest).toBe(zzRequest);
+  });
+  it('does not materialize accessor/inherited/Proxy cyber controls while attaching normalized request evidence', () => {
+    const confirmed = throwsFromFrame({ code: 'cyber_policy', message: 'Disposable confirmed frame.' }) as MembraneError;
+    expect(new MembraneError(confirmed.toErrorInfo()).providerErrorCode).toBe('cyber_policy');
+    for (const field of ['type', 'retryable', 'providerErrorCode'] as const) {
+      const accessor = new MembraneError(confirmed.toErrorInfo());
+      Object.defineProperty(accessor, field, { get() { return field === 'type' ? 'safety' : field === 'retryable' ? false : 'cyber_policy'; } });
+      expect(new MembraneError(accessor.toErrorInfo()).providerErrorCode).toBeUndefined();
+      const inherited = new MembraneError(confirmed.toErrorInfo()); Reflect.deleteProperty(inherited, field);
+      Object.setPrototypeOf(inherited, Object.assign(Object.create(MembraneError.prototype), { [field]: field === 'type' ? 'safety' : field === 'retryable' ? false : 'cyber_policy' }));
+      expect(new MembraneError(inherited.toErrorInfo()).providerErrorCode).toBeUndefined();
+    }
+    const proxy = new Proxy(confirmed, {}); expect(new MembraneError(proxy.toErrorInfo()).providerErrorCode).toBeUndefined();
+  });
+  it('never promotes prose, status, wrong codes, inherited fields, getters or proxies', () => {
+    let getters = 0; let traps = 0;
+    const inherited = Object.assign(Object.create({ code: 'cyber_policy' }), { message: 'Disposable frame.' });
+    const accessor = Object.defineProperty({ message: 'Disposable frame.' }, 'code', { enumerable: true, get() { getters++; return 'cyber_policy'; } });
+    const proxy = new Proxy({ code: 'cyber_policy', message: 'Disposable frame.' }, { get() { traps++; return 'cyber_policy'; }, getOwnPropertyDescriptor() { traps++; throw new Error('must not reflect'); } });
+    for (const fields of [
+      { message: 'cyber_policy safety policy blocked' }, { status: 'cyber_policy', message: 'Disposable frame.' },
+      ...['CYBER_POLICY', ' cyber_policy', 'cyber_policy ', 'other_safety', 403, null, {}].map(code => ({ code, message: 'Disposable frame.' })),
+      inherited, accessor, proxy,
+    ]) {
+      const error = throwsFromFrame(fields) as MembraneError;
+      expect(error.providerErrorCode).not.toBe('cyber_policy');
+    }
+    expect(getters).toBe(0); expect(traps).toBe(0);
+    const outer = Object.defineProperty({}, 'error', { get() { getters++; return { code: 'cyber_policy' }; } });
+    expect(() => throwOnStreamErrorFrame(outer, 'fixture')).not.toThrow(); expect(getters).toBe(0);
+  });
+});
+
 describe('throwOnStreamErrorFrame rate-limit frames', () => {
   it('classifies a numeric 429 code as a retryable rate limit and keeps the provider message', () => {
     const thrown = throwsFromFrame({ code: 429, message: 'zz quota gone for this key' });

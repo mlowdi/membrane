@@ -1,4 +1,5 @@
-import { TimeoutAbortError, authError, networkError, rateLimitError, serverError } from '../types/errors.js';
+import { types } from 'node:util';
+import { MembraneError, TimeoutAbortError, authError, networkError, rateLimitError, serverError } from '../types/errors.js';
 
 interface StreamErrorFrameFields {
   code?: unknown;
@@ -94,6 +95,7 @@ function frameTokensMatch(tokens: string[], needles: string[]): boolean {
  * the provider was explicitly asking for. Classified failures reach the caller
  * intact because every adapter's `handleError` returns a MembraneError
  * unchanged. Mapping, using the structured fields only:
+ *   - exact error.code `cyber_policy` -> safety (non-retryable)
  *   - 429, or a rate-limit-shaped token  -> rate_limit (retryable), carrying
  *     the frame's retry hint when it has one
  *   - 5xx, or an overloaded/server-shaped token -> server (retryable);
@@ -117,12 +119,19 @@ export function throwOnStreamErrorFrame(
   rawRequest?: unknown,
   errorNoun: string = 'stream error'
 ): void {
-  if (typeof parsed !== 'object' || parsed === null) return;
-  const streamError = (parsed as { error?: unknown }).error;
+  if (typeof parsed !== 'object' || parsed === null || types.isProxy(parsed)) return;
+  const streamError = Object.getOwnPropertyDescriptor(parsed, 'error')?.value;
   if (!streamError) return;
+  if (typeof streamError === 'object' && types.isProxy(streamError)) {
+    throw new Error(`${providerLabel} ${errorNoun}: untrusted error frame`);
+  }
 
-  const fields: StreamErrorFrameFields =
-    typeof streamError === 'object' ? (streamError as StreamErrorFrameFields) : {};
+  // JSON provider frames have own data fields. Never promote inherited values,
+  // getters or Proxy traps to the one trusted policy-routing signal.
+  const fields: StreamErrorFrameFields = typeof streamError === 'object'
+    ? Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(streamError))
+      .filter(([, descriptor]) => 'value' in descriptor)
+      .map(([key, descriptor]) => [key, descriptor.value])) : {};
   const httpStatus = readNumericField(fields.code, fields.status);
   const tokens = readFrameClassificationTokens(fields);
   const providerMessage =
@@ -134,6 +143,13 @@ export function throwOnStreamErrorFrame(
     `${providerLabel} ${errorNoun}` +
     `${httpStatus !== undefined ? ` (${httpStatus})` : ''}` +
     `${tokens.length > 0 ? ` [${tokens.join(' ')}]` : ''}: ${providerMessage}`;
+
+  if (fields.code === 'cyber_policy') {
+    throw new MembraneError({
+      type: 'safety', retryable: false, providerErrorCode: 'cyber_policy',
+      message: description, rawError: parsed, rawRequest,
+    });
+  }
 
   if (httpStatus === 429 || frameTokensMatch(tokens, RATE_LIMIT_FRAME_TOKENS)) {
     throw rateLimitError(description, readFrameRetryAfterMs(fields), parsed, rawRequest);

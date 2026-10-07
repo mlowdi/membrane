@@ -1,7 +1,8 @@
-import type { ImageContent, ProviderRequest } from '../types/index.js';
+import type { ContentBlock, ImageContent, ProviderRequest } from '../types/index.js';
 import type { OpenAIResponsesInputItem } from './openai-responses-api.js';
 import { normalizeImageContent, IMAGE_UNAVAILABLE_TEXT, isVisualImageContent, asImageContent, ASSISTANT_GENERATED_IMAGE_ORIGIN_TEXT,
-  projectResponsesGeneratedImage, sameResponsesItem } from '../utils/image-policy.js';
+  isValidImageBase64, projectResponsesGeneratedImage, sameResponsesItem } from '../utils/image-policy.js';
+import { isAcceptedImageMediaType, resolveImageMediaType } from '../utils/image-media.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -57,7 +58,7 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
       if (rawBlock.type === 'text') {
         parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: asString(rawBlock.text) });
       } else if (isVisualImageContent(rawBlock)) {
-        const visual = normalizeImageContent(rawBlock);
+        const visual = normalizeTransportImage(rawBlock);
         if (visual.type === 'generated_image' && isObject(visual.rawItem) && projectResponsesGeneratedImage(visual.rawItem)) {
           flush();
           const rawItem = visual.rawItem;
@@ -99,6 +100,10 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
 /** Responses tool outputs accept typed image parts. Serializing those parts
  * into a string makes their base64 data ordinary prompt text instead. */
 export function responsesToolResultOutput(content: unknown): string | JsonObject[] {
+  return projectToolResultOutput(content, false);
+}
+
+function projectToolResultOutput(content: unknown, transport: boolean): string | JsonObject[] {
   if (!Array.isArray(content)) {
     return typeof content === 'string' ? content : JSON.stringify(content ?? null);
   }
@@ -106,11 +111,11 @@ export function responsesToolResultOutput(content: unknown): string | JsonObject
     if (isObject(block)) {
       if (block.type === 'text') return [{ type: 'input_text', text: asString(block.text) }];
       if (block.type === 'tool_result') {
-        const nested = responsesToolResultOutput(block.content);
+        const nested = projectToolResultOutput(block.content, transport);
         return typeof nested === 'string' ? [{ type: 'input_text', text: nested }] : nested;
       }
       if (isVisualImageContent(block) || block.type === 'input_image') {
-        const imageUrl = responsesImageUrl(block);
+        const imageUrl = responsesImageUrl(block, transport);
         return [imageUrl ? { type: 'input_image', image_url: imageUrl }
           : { type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT }];
       }
@@ -134,7 +139,7 @@ function normalizeStandaloneItem(item: JsonObject): unknown {
     return {
       type: 'function_call_output',
       call_id: asString(item.toolUseId) || asString(item.tool_use_id),
-      output: responsesToolResultOutput(content),
+      output: projectToolResultOutput(content, true),
     };
   }
   if (item.type === 'redacted_thinking') {
@@ -156,8 +161,29 @@ function reasoningInputItem(block: JsonObject): unknown {
   return { type: 'reasoning', summary: [], encrypted_content: asString(block.data) };
 }
 
-function responsesImageUrl(block: JsonObject): string | undefined {
-  const visual = normalizeImageContent(block);
+/** At the Responses transport only, canonicalize a recognizable raster before
+ * the shared strict MIME gate. MCP/direct formatter ingress still requires a
+ * declared supported MIME; malformed base64 and unknown bytes cannot bypass it. */
+function normalizeTransportImage(block: JsonObject): ContentBlock {
+  const source = block.source;
+  if (block.type === 'image' && isObject(source) && source.type === 'base64' &&
+      typeof source.data === 'string' && isValidImageBase64(source.data)) {
+    const declared = source.mediaType ?? source.media_type;
+    if ((declared === undefined || typeof declared === 'string') &&
+        (source.mediaType === undefined || typeof source.mediaType === 'string') &&
+        (source.media_type === undefined || typeof source.media_type === 'string') &&
+        !isAcceptedImageMediaType(declared)) {
+      const sniffed = resolveImageMediaType(source.data);
+      if (isAcceptedImageMediaType(sniffed)) {
+        return normalizeImageContent({ ...block, source: { ...source, mediaType: sniffed } });
+      }
+    }
+  }
+  return normalizeImageContent(block);
+}
+
+function responsesImageUrl(block: JsonObject, transport: boolean): string | undefined {
+  const visual = transport ? normalizeTransportImage(block) : normalizeImageContent(block);
   if (!isVisualImageContent(visual)) return undefined;
   return admittedImageUrl(asImageContent(visual));
 }

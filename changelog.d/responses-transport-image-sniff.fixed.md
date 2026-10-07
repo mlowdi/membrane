@@ -1,0 +1,1 @@
+- Correct recognizable raster MIME labels for normalized base64 images at the Responses transport boundary, including unsupported or missing declarations, without weakening MCP/direct formatter admission or malformed-base64 rejection. Unknown bytes keep the existing supported declared-MIME fallback; native replay and URL images remain unchanged.

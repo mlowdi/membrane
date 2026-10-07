@@ -1,6 +1,7 @@
 /**
  * Error types for membrane
  */
+import { types } from 'node:util';
 
 // ============================================================================
 // Error Serialization Helper
@@ -112,13 +113,19 @@ export class MembraneError extends Error {
   }
 
   toErrorInfo(): ErrorInfo {
+    // complete()/attachRawRequest rebuild normalized errors from this object.
+    // Do not turn inherited/getter/Proxy cyber fields into trusted own data.
+    const code = !types.isProxy(this) ? Object.getOwnPropertyDescriptor(this, 'providerErrorCode')?.value : undefined;
+    const trustedCyber = code === 'cyber_policy' && Object.getOwnPropertyDescriptor(this, 'type')?.value === 'safety' &&
+      Object.getOwnPropertyDescriptor(this, 'retryable')?.value === false;
+    const providerErrorCode = typeof code === 'string' && (code !== 'cyber_policy' || trustedCyber) ? code : undefined;
     return {
       type: this.type,
       message: this.message,
       retryable: this.retryable,
       retryAfterMs: this.retryAfterMs,
       httpStatus: this.httpStatus,
-      providerErrorCode: this.providerErrorCode,
+      providerErrorCode,
       rawError: this.rawError,
       rawRequest: this.rawRequest,
     };

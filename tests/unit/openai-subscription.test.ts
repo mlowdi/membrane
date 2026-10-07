@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { Membrane, OpenAIResponsesFormatter } from '../../src/index.js';
 import type { ProviderRequest } from '../../src/index.js';
 import { OpenAIResponsesAPIAdapter, type CredentialResolver } from '../../src/index.js';
+import { IMAGE_UNAVAILABLE_TEXT } from '../../src/utils/image-policy.js';
 
 const originalFetch = globalThis.fetch;
 
@@ -231,6 +232,7 @@ describe('OpenAI Responses subscription mode', () => {
 
   test.each(['complete', 'stream'] as const)('%s sniffs normalized image bytes at the subscription transport boundary', async (lane) => {
     const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+    const opaque = 'AAECAw=='; // Valid base64, but not a supported image signature.
     let body: Record<string, any> = {};
     globalThis.fetch = async (_input, init) => {
       body = JSON.parse(String(init?.body));
@@ -250,7 +252,12 @@ describe('OpenAI Responses subscription mode', () => {
             { media_type: 'image/svg+xml' },
             {},
           ].map(label => ({ type: 'image', source: { type: 'base64', data: png, ...label } })),
-          { type: 'image', source: { type: 'base64', mediaType: 'image/gif', data: 'unknown' } },
+          { type: 'image', source: { type: 'base64', mediaType: 'image/gif', data: opaque } },
+          { type: 'image', source: { type: 'base64', mediaType: 'image/svg+xml', data: 'PHN2Zy8+' } },
+          { type: 'image', source: { type: 'base64', data: opaque } },
+          { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: '%%%%' } },
+          { type: 'image', source: { type: 'base64', mediaType: null, data: png } },
+          { type: 'image', source: { type: 'base64', mediaType: 42, data: png } },
           { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
           // Already-native items are replayed verbatim, not reinterpreted.
           { type: 'input_image', image_url: nativeUrl },
@@ -262,7 +269,8 @@ describe('OpenAI Responses subscription mode', () => {
     else await adapter.stream(req, { onChunk: () => {} });
     expect(body.input[0].content).toEqual([
       ...Array.from({ length: 3 }, () => ({ type: 'input_image', image_url: 'data:image/png;base64,' + png })),
-      { type: 'input_image', image_url: 'data:image/gif;base64,unknown' },
+      { type: 'input_image', image_url: 'data:image/gif;base64,' + opaque },
+      ...Array.from({ length: 5 }, () => ({ type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT })),
       { type: 'input_image', image_url: 'https://example.test/image.png' },
       { type: 'input_image', image_url: nativeUrl },
     ]);
@@ -360,6 +368,64 @@ describe('OpenAI Responses subscription mode', () => {
       /context_length_exceeded.*input is too large/,
     );
   });
+});
+
+describe('Responses structured error-frame classification', () => {
+  const frames = ['response.failed', 'nested error', 'top-level error'] as const;
+  const lanes = ['complete', 'stream'] as const;
+
+  function errorEvent(frame: typeof frames[number], error: Record<string, unknown>) {
+    return frame === 'response.failed'
+      ? { type: 'response.failed', response: { status: 'failed', error } }
+      : frame === 'nested error' ? { type: 'error', error } : { type: 'error', ...error };
+  }
+
+  for (const frame of frames) for (const lane of lanes) {
+    test(`${lane}: exact cyber_policy in ${frame} is terminal safety with intact raw fields`, async () => {
+      const fields = { code: 'cyber_policy', message: 'Disposable structured safeguard stop.',
+        ...(frame === 'top-level error' ? {} : { type: 'invalid_request_error' }) };
+      const event = errorEvent(frame, fields);
+      let calls = 0;
+      let body: unknown;
+      globalThis.fetch = async (_input, init) => {
+        calls++; body = JSON.parse(String(init?.body));
+        return new Response(`data: ${JSON.stringify(event)}\n\n`);
+      };
+      const adapter = new OpenAIResponsesAPIAdapter({ mode: 'subscription', credentials: () => ({ token: 'fixture-token' }) });
+      const result = lane === 'complete' ? adapter.complete(request()) : adapter.stream(request(), { onChunk: () => {} });
+      const error = await result.catch(error => error);
+      expect(error).toMatchObject({ name: 'MembraneError', type: 'safety', retryable: false, rawRequest: body });
+      expect(error.httpStatus).toBeUndefined();
+      expect(error.providerErrorCode).toBe('cyber_policy'); // Exact trusted structured frame branch only.
+      expect(error.rawError).toEqual('response' in event ? event.response : { error: fields });
+      expect(calls).toBe(1);
+    });
+  }
+
+  const classifications: Array<{ fields: Record<string, unknown>; type: string; retryable: boolean }> = [
+    { fields: { code: 'unrecognized', message: 'cyber_policy safety policy blocked' }, type: 'unknown', retryable: false },
+    { fields: { code: 'cyber_policy_extra', message: 'Disposable stop.' }, type: 'unknown', retryable: false },
+    { fields: { type: 'cyber_policy', message: 'Disposable stop.' }, type: 'unknown', retryable: false },
+    { fields: { status: 'cyber_policy', message: 'Disposable stop.' }, type: 'unknown', retryable: false },
+    { fields: { code: 'CYBER_POLICY', message: 'Disposable stop.' }, type: 'unknown', retryable: false },
+    { fields: { code: 'invalid_api_key', message: 'Disposable stop.' }, type: 'auth', retryable: false },
+    { fields: { status: 429, retry_after_ms: 123, message: 'Disposable stop.' }, type: 'rate_limit', retryable: true },
+    { fields: { type: 'overloaded_error', message: 'Disposable stop.' }, type: 'server', retryable: true },
+    { fields: { status: 503, message: 'Disposable stop.' }, type: 'server', retryable: true },
+    { fields: { code: 'context_length_exceeded', message: 'Disposable stop.' }, type: 'context_length', retryable: false },
+    { fields: { code: 'unrecognized', message: 'network connection dropped' }, type: 'network', retryable: true },
+  ];
+  for (const frame of ['response.failed', 'nested error'] as const) for (const { fields, type, retryable } of classifications) {
+    test(`${frame}: ${JSON.stringify(fields)} retains ${type} classification`, async () => {
+      globalThis.fetch = async () => new Response(`data: ${JSON.stringify(errorEvent(frame, fields))}\n\n`);
+      const adapter = new OpenAIResponsesAPIAdapter({ mode: 'subscription', credentials: () => ({ token: 'fixture-token' }) });
+      const error = await adapter.complete(request()).catch(error => error);
+      expect(error).toMatchObject({ type, retryable });
+      if ('retry_after_ms' in fields) expect(error.retryAfterMs).toBe(123);
+      if (fields.type === 'overloaded_error') expect(error.httpStatus).toBe(529);
+      if (fields.status === 503) expect(error.httpStatus).toBe(503);
+    });
+  }
 });
 
 // These exercise the shared transport directly, without a host or Codex CLI.

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { OpenAIResponsesFormatter } from '../../src/formatters/openai-responses.js';
 import { normalizeResponsesInput, responsesToolResultOutput } from '../../src/providers/responses-input.js';
 import { IMAGE_UNAVAILABLE_TEXT } from '../../src/utils/image-policy.js';
+import type { ProviderRequest, ToolResult } from '../../src/types/index.js';
 
 const options = {
   participantMode: 'multiuser' as const,
@@ -62,6 +63,35 @@ describe('tool results carrying images (Responses)', () => {
       call_id: 'call_3',
       output: [{ type: 'input_image', image_url: 'https://example.com/a.png' }],
     }]);
+  });
+
+  it('keeps direct formatter tool-result admission MIME-required', () => {
+    const content = [
+      { type: 'image', source: { ...png, mediaType: 'image/svg+xml' } },
+      { type: 'image', source: { type: 'base64', data: png.data } },
+    ];
+    const original = structuredClone(content);
+    // Deliberately malformed normalized blocks exercise the runtime admission boundary.
+    const result = { toolUseId: 'strict', content } as unknown as ToolResult;
+    expect(JSON.parse(new OpenAIResponsesFormatter().formatToolResults([result]))).toEqual([{
+      type: 'function_call_output', call_id: 'strict',
+      output: Array.from({ length: 2 }, () => ({ type: 'input_text', text: IMAGE_UNAVAILABLE_TEXT })),
+    }]);
+    expect(content).toEqual(original);
+  });
+
+  it('subscription transport sniffs nested tool-result images without altering the source', () => {
+    const content = [{ type: 'tool_result', content: [
+      { type: 'image', source: { ...png, mediaType: 'image/svg+xml' } },
+      { type: 'image', source: { type: 'base64', data: png.data } },
+    ] }];
+    const original = structuredClone(content);
+    const messages = [{ type: 'tool_result', toolUseId: 'transport', content }] as unknown as ProviderRequest['messages'];
+    expect(normalizeResponsesInput(messages)).toEqual([{
+      type: 'function_call_output', call_id: 'transport',
+      output: Array.from({ length: 2 }, () => ({ type: 'input_image', image_url: 'data:image/png;base64,' + png.data })),
+    }]);
+    expect(content).toEqual(original);
   });
 
   it('helper preserves strings, projects text arrays and bounds unusable image sources', () => {

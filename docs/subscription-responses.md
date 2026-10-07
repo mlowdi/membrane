@@ -47,8 +47,14 @@ fallback tier invokes the optional callback once per adapter.
 
 Native Responses items retain their metadata and encrypted reasoning. The
 subscription compatibility path also accepts normalized maintenance text,
-images, tool calls/results, and encrypted reasoning blocks. API mode retains its
-existing verbatim native-input contract. Subscription mode honors per-request formatter overrides, retaining names in
+images, tool calls/results, and encrypted reasoning blocks. Recognizable supported
+raster signatures on normalized base64 images correct unsupported or missing MIME
+labels at this transport boundary; valid base64 without a recognized signature
+still needs a supported declared MIME. That legacy unknown-byte fallback is
+compatibility behavior, not arbitrary-format validation. Malformed base64 remains
+unavailable, and MCP/direct formatter image admission still requires its declared MIME.
+Already-native `input_image` items and URL sources retain their existing handling.
+API mode retains its existing verbatim native-input contract. Subscription mode honors per-request formatter overrides, retaining names in
 multi-participant maintenance calls. API mode keeps its native-input formatter
 guard. Decorators must forward `requiresNativeResponsesInput` and
 `usageCacheConvention` so these contracts survive wrapping. Both modes share output reconstruction,
